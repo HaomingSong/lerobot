@@ -26,6 +26,7 @@ from lerobot.configs.types import FeatureType, PipelineFeatureType, PolicyFeatur
 from lerobot.policies.eo1.configuration_eo1 import EO1Config
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
+    ComplementaryDataProcessorStep,
     DeviceProcessorStep,
     NormalizerProcessorStep,
     ObservationProcessorStep,
@@ -38,6 +39,7 @@ from lerobot.processor import (
     UnnormalizerProcessorStep,
 )
 from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
+from lerobot.processor.core import TransitionKey
 from lerobot.utils.constants import (
     ACTION,
     OBS_STATE,
@@ -47,31 +49,14 @@ from lerobot.utils.constants import (
 
 SYSTEM_MESSAGE = "You are a helpful physical assistant."
 
-# qwen2.5-vl special tokens
-DEFAULT_IM_START_TOKEN = "<|im_start|>"
-DEFAULT_IM_END_TOKEN = "<|im_end|>"
-DEFAULT_IMAGE_TOKEN = "<|image_pad|>"
-DEFAULT_VIDEO_TOKEN = "<|video_pad|>"
-VISION_START_TOKEN = "<|vision_start|>"
-VISION_END_TOKEN = "<|vision_end|>"
-
 # EO-1 special tokens
 ACTION_START_TOKEN = "<|action_start|>"
 DEFAULT_ACTION_TOKEN = "<|action_pad|>"
-PASS_ACTION_TOKEN = "<|action_pass|>"
 ACTION_END_TOKEN = "<|action_end|>"
 STATE_START_TOKEN = "<|state_start|>"
 DEFAULT_STATE_TOKEN = "<|state_pad|>"
 STATE_END_TOKEN = "<|state_end|>"
 TASK_VLA_TOKEN = "<|vla|>"
-
-# llava style special tokens
-IGNORE_INDEX = -100
-LLAVA_IMAGE_TOKEN = "<image>"
-LLAVA_VIDEO_TOKEN = "<video>"
-LLAVA_ACTION_TOKEN = "<action>"
-LLAVA_STATE_TOKEN = "<state>"
-LLAVA_VLA_TOKEN = "<vla>"
 
 
 def get_image_info(image_path, min_pixel, max_pixel, width, height):
@@ -196,7 +181,7 @@ class EO1ImageSmartResizeStep(ObservationProcessorStep):
     image_resized_height: int | None = None
     size_factor: int = IMAGE_FACTOR
 
-    resized_features: dict[str, PolicyFeature] = field(default_factory=dict, init=False, repr=False)
+    _resized_features: dict[str, PolicyFeature] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self):
 
@@ -230,7 +215,7 @@ class EO1ImageSmartResizeStep(ObservationProcessorStep):
                     min_pixels=self.image_min_pixels,
                     max_pixels=self.image_max_pixels,
                 )
-            self.resized_features[key] = PolicyFeature(
+            self._resized_features[key] = PolicyFeature(
                 type=FeatureType.VISUAL, shape=(channels, resized_height, resized_width)
             )
 
@@ -261,7 +246,7 @@ class EO1ImageSmartResizeStep(ObservationProcessorStep):
         """Resize the image to the resized_features."""
         processed_obs = observation.copy()
 
-        for key, value in self.resized_features.items():
+        for key, value in self._resized_features.items():
             if key not in processed_obs:
                 raise ValueError(f"Missing visual observation '{key}' required by {self.__class__.__name__}.")
             _, resized_height, resized_width = value.shape
@@ -280,9 +265,95 @@ class EO1ImageSmartResizeStep(ObservationProcessorStep):
         Returns:
             The feature dictionary with the image resized to the resized_features.
         """
-        for key, value in self.resized_features.items():
+        for key, value in self._resized_features.items():
             features[PipelineFeatureType.OBSERVATION][key] = value
         return features
+
+
+@dataclass
+@ProcessorStepRegistry.register(name="eo1_conversation_template_processor")
+class EO1ConversationTemplateStep(ComplementaryDataProcessorStep):
+    input_features: dict[str, PolicyFeature] | dict[str, dict[str, Any]]
+    chunk_size: int
+
+    _image_keys: list[str] = field(default_factory=list, init=False, repr=False)
+
+    def __post_init__(self):
+        # Robust JSON deserialization handling (guard empty maps).
+        if self.input_features:
+            first_val = next(iter(self.input_features.values()))
+            if isinstance(first_val, dict):
+                reconstructed = {}
+                for key, ft_dict in self.input_features.items():
+                    reconstructed[key] = PolicyFeature(
+                        type=FeatureType(ft_dict["type"]), shape=tuple(ft_dict["shape"])
+                    )
+                self.input_features = reconstructed
+
+        self._image_keys = [
+            key for key, value in self.input_features.items() if value.type == FeatureType.VISUAL
+        ]
+
+    def complementary_data(self, complementary_data):
+        tasks = complementary_data.get("task")
+        if tasks is None:
+            raise ValueError("Task is required for EO1ConversationTemplateStep.")
+
+        observation = self.transition.get(TransitionKey.OBSERVATION)
+        if observation is None:
+            raise ValueError("Observation is required for EO1ConversationTemplateStep.")
+
+        if OBS_STATE in observation and observation[OBS_STATE].shape[0] != len(tasks):
+            raise ValueError("Batch size mismatch between observation.state and task list.")
+
+        messages = []
+        for i in range(len(tasks)):
+            content = [
+                *[{"type": "image", "image": observation[key][i]} for key in self._image_keys],
+                {
+                    "type": "text",
+                    "text": (
+                        f"{STATE_START_TOKEN}{DEFAULT_STATE_TOKEN}{STATE_END_TOKEN}{tasks[i]}{TASK_VLA_TOKEN}"
+                    ),
+                },
+            ]
+            messages.append(
+                [
+                    {"role": "system", "content": [{"type": "text", "text": SYSTEM_MESSAGE}]},
+                    {"role": "user", "content": content},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": f"{ACTION_START_TOKEN}{DEFAULT_ACTION_TOKEN * self.chunk_size}{ACTION_END_TOKEN}",
+                            }
+                        ],
+                    },
+                ]
+            )
+
+        complementary_data["messages"] = messages
+
+        return complementary_data
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        """
+        This step only materializes EO1-specific message objects in complementary_data.
+        PipelineFeatureType tracks only ACTION and OBSERVATION, so there is no static
+        feature contract change to record here.
+        """
+        return features
+
+    def get_config(self) -> dict[str, Any]:
+        return {
+            "input_features": {
+                key: {"type": ft.type.value, "shape": ft.shape} for key, ft in self.input_features.items()
+            },
+            "chunk_size": self.chunk_size,
+        }
 
 
 def make_eo1_pre_post_processors(
@@ -312,6 +383,7 @@ def make_eo1_pre_post_processors(
         ),
         EO1ActionPaddingProcessorStep(max_action_dim=config.max_action_dim),
         EO1StatePaddingProcessorStep(max_state_dim=config.max_state_dim),
+        EO1ConversationTemplateStep(input_features=config.input_features, chunk_size=config.chunk_size),
         DeviceProcessorStep(device=config.device),
     ]
 

@@ -24,6 +24,7 @@ from torchvision.transforms import InterpolationMode
 
 from lerobot.configs.types import FeatureType, PipelineFeatureType, PolicyFeature
 from lerobot.policies.eo1.configuration_eo1 import EO1Config
+from lerobot.policies.eo1.qwen2_5_vl.processing_qwen2_5_vl import Qwen2_5_VLProcessor
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     ComplementaryDataProcessorStep,
@@ -89,6 +90,7 @@ def pad_vector(vector, new_dim):
     return new_vector
 
 
+@dataclass
 @ProcessorStepRegistry.register(name="eo1_action_padding_processor")
 class EO1ActionPaddingProcessorStep(PolicyActionProcessorStep):
     max_action_dim: int
@@ -356,6 +358,71 @@ class EO1ConversationTemplateStep(ComplementaryDataProcessorStep):
         }
 
 
+@dataclass
+@ProcessorStepRegistry.register(name="eo1_qwen_processor")
+class EO1QwenProcessorStep(ComplementaryDataProcessorStep):
+    # processor_name: str = "/mnt/inspurfs/evla2_t/eo-robotics/eo1_artifacts/Qwen2.5-VL-3B-Instruct"
+    processor_name: str = "Qwen/Qwen2.5-VL-3B-Instruct"
+
+    _processor: Qwen2_5_VLProcessor | None = field(default=None, init=False, repr=False)
+    _state_token_id: int | None = field(default=None, init=False, repr=False)
+    _action_token_id: int | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self):
+        self._processor = Qwen2_5_VLProcessor.from_pretrained(self.processor_name)
+
+        special_tokens = [
+            ACTION_START_TOKEN,
+            DEFAULT_ACTION_TOKEN,
+            ACTION_END_TOKEN,
+            STATE_START_TOKEN,
+            DEFAULT_STATE_TOKEN,
+            STATE_END_TOKEN,
+            TASK_VLA_TOKEN,
+        ]
+        self._processor.tokenizer.add_tokens(special_tokens, special_tokens=True)
+        self._state_token_id = self._processor.tokenizer.convert_tokens_to_ids(DEFAULT_STATE_TOKEN)
+        self._action_token_id = self._processor.tokenizer.convert_tokens_to_ids(DEFAULT_ACTION_TOKEN)
+
+    def complementary_data(self, complementary_data):
+        messages = complementary_data.pop("messages", None)
+        if messages is None:
+            raise ValueError("Messages are required for EO1QwenProcessorStep.")
+
+        inputs = self._processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            padding=True,
+            do_resize=False,
+            add_generation_prompt=False,
+            return_dict=True,
+            return_tensors="pt",
+        )
+
+        complementary_data["input_ids"] = inputs["input_ids"]
+        complementary_data["pixel_values"] = inputs["pixel_values"]
+        complementary_data["image_grid_thw"] = inputs["image_grid_thw"]
+
+        complementary_data["attention_mask"] = inputs["attention_mask"]
+        complementary_data["state_token_id"] = self._state_token_id
+        complementary_data["action_token_id"] = self._action_token_id
+
+        return complementary_data
+
+    def get_config(self) -> dict[str, Any]:
+        return {
+            "processor_name": self.processor_name,
+        }
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        """
+        This step only converts the messages to the model input format.
+        """
+        return features
+
+
 def make_eo1_pre_post_processors(
     config: EO1Config,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
@@ -384,6 +451,7 @@ def make_eo1_pre_post_processors(
         EO1ActionPaddingProcessorStep(max_action_dim=config.max_action_dim),
         EO1StatePaddingProcessorStep(max_state_dim=config.max_state_dim),
         EO1ConversationTemplateStep(input_features=config.input_features, chunk_size=config.chunk_size),
+        EO1QwenProcessorStep(processor_name=config.vlm_base),
         DeviceProcessorStep(device=config.device),
     ]
 

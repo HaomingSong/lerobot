@@ -40,16 +40,11 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class EO1VisionFlowMatchingOutputWithPast(ModelOutput):
-    loss: torch.FloatTensor | None = None
     fm_loss: torch.FloatTensor | None = None
-    ar_loss: torch.FloatTensor | None = None
-
-    actions: torch.FloatTensor | None = None
     logits: torch.FloatTensor | None = None
-
     past_key_values: list[torch.FloatTensor] | None = None
-    hidden_states: tuple[torch.FloatTensor] | None = None
-    attentions: tuple[torch.FloatTensor] | None = None
+    hidden_states: torch.FloatTensor | None = None
+    attentions: torch.FloatTensor | None = None
     rope_deltas: torch.LongTensor | None = None
 
 
@@ -92,15 +87,10 @@ class EO1Policy(PreTrainedPolicy):
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
 
-        state = self.prepare_state(batch)
-        actions = self.prepare_action(batch)
+        state = batch.get(OBS_STATE)
+        outputs = self.model(states=state, **batch)
 
-        batch[ACTION] = actions
-        batch[OBS_STATE] = state
-
-        outputs = self.model(**batch)
-
-        loss = outputs.loss
+        loss = outputs.fm_loss
 
         loss_dict = {"loss": loss.item()}
         return loss, loss_dict
@@ -119,16 +109,6 @@ class EO1Policy(PreTrainedPolicy):
         # Unpad actions to actual action dimension
         original_action_dim = self.config.output_features[ACTION].shape[0]
         return actions[:, :, :original_action_dim]
-
-    def prepare_state(self, batch):
-        """Pad state"""
-        state = pad_vector(batch[OBS_STATE], self.config.max_state_dim)
-        return state
-
-    def prepare_action(self, batch):
-        """Pad action"""
-        actions = pad_vector(batch[ACTION], self.config.max_action_dim)
-        return actions
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
@@ -335,56 +315,36 @@ class EO1VisionFlowMatchingModel(nn.Module):
         self,
         input_ids: torch.LongTensor | None = None,
         attention_mask: torch.Tensor | None = None,
-        position_ids: torch.LongTensor | None = None,
-        past_key_values: list[torch.FloatTensor] | None = None,
-        inputs_embeds: torch.FloatTensor | None = None,
-        labels: torch.LongTensor | None = None,
-        use_cache: bool | None = None,
-        output_attentions: bool | None = None,
-        output_hidden_states: bool | None = None,
         pixel_values: torch.Tensor | None = None,
-        pixel_values_videos: torch.FloatTensor | None = None,
         image_grid_thw: torch.LongTensor | None = None,
-        video_grid_thw: torch.LongTensor | None = None,
-        rope_deltas: torch.LongTensor | None = None,
-        cache_position: torch.LongTensor | None = None,
-        second_per_grid_ts: torch.Tensor | None = None,
-        logits_to_keep: int | torch.Tensor = 0,
         states: torch.Tensor | None = None,
-        actions: torch.Tensor | None = None,
+        action: torch.Tensor | None = None,
         action_is_pad: torch.Tensor | None = None,
+        state_token_id: int = 151666,
+        action_token_id: int = 151669,
         **kwargs,
     ) -> EO1VisionFlowMatchingOutputWithPast:
         """multi-modal forward pass, including image, video, state, action, and language."""
         inputs_embeds = self.embed_prefix(
             input_ids,
-            inputs_embeds,
             pixel_values,
-            pixel_values_videos,
             image_grid_thw,
-            video_grid_thw,
             states,
         )
 
-        if actions is not None:
-            noise_mask = input_ids == self.config.action_token_id
-            pass_mask = input_ids == self.config.action_pass_id
-            mask = noise_mask | pass_mask  # (b s)
+        if action is not None:
+            noise_mask = input_ids == action_token_id
+            mask = noise_mask
 
-            pass_mask_in_action = pass_mask[mask]  # (n, )
-            pass_mask_in_action = pass_mask_in_action.reshape(*actions.shape[:2], 1)  # (b, h, 1)
+            time = self.sample_time(action.shape[0], inputs_embeds.device)  # (n,)
+            time_expanded = time[:, None, None].repeat(1, action.shape[1], 1)  # (b, h, 1)
 
-            time = self.sample_time(actions.shape[0], inputs_embeds.device)  # (n,)
-            time_expanded = time[:, None, None].repeat(1, actions.shape[1], 1)  # (b, h, 1)
-            time_expanded[pass_mask_in_action] = 0.0
-
-            noise = self.sample_noise(actions.shape, inputs_embeds.device)
-            x_t = time_expanded * noise + (1 - time_expanded) * actions
-            u_t = noise - actions
+            noise = self.sample_noise(action.shape, inputs_embeds.device)
+            x_t = time_expanded * noise + (1 - time_expanded) * action
+            u_t = noise - action
 
             action_time_embs = self.embed_suffix(time, x_t)
-            mask_unsqueezed = mask.unsqueeze(-1)
-            mask_expanded = mask_unsqueezed.expand_as(inputs_embeds)
+            mask_expanded = mask.unsqueeze(-1).expand_as(inputs_embeds)
             action_mask = mask_expanded.to(inputs_embeds.device)
 
             action_time_embs = action_time_embs.to(inputs_embeds.device, inputs_embeds.dtype)
@@ -393,65 +353,19 @@ class EO1VisionFlowMatchingModel(nn.Module):
         if attention_mask is not None:
             attention_mask = attention_mask.to(inputs_embeds.device)
 
-        if position_ids is None:
-            prefill_noncompiled_stage = (cache_position is not None and cache_position[0] == 0) or (
-                past_key_values is None or past_key_values.get_seq_length() == 0
-            )
-            if prefill_noncompiled_stage or self.vlm_backbone.rope_deltas is None:
-                position_ids, rope_deltas = self.vlm_backbone.get_rope_index(
-                    input_ids,
-                    image_grid_thw,
-                    video_grid_thw,
-                    second_per_grid_ts=second_per_grid_ts,
-                    attention_mask=attention_mask,
-                )
-                self.vlm_backbone.rope_deltas = rope_deltas
-            else:
-                batch_size, seq_length, _ = inputs_embeds.shape
-                position_ids = torch.arange(seq_length, device=inputs_embeds.device)
-                position_ids = position_ids.view(1, 1, -1).expand(3, batch_size, -1)
-                if cache_position is not None:
-                    delta = (cache_position[0] + self.vlm_backbone.rope_deltas).to(inputs_embeds.device)
-                else:
-                    delta = torch.zeros((batch_size, seq_length), device=inputs_embeds.device)
-                delta = delta.repeat_interleave(batch_size // delta.shape[0], dim=1)
-                position_ids += delta.to(position_ids.device)
+        # HACK: avoid forward pass in lm_head of vlm_backbone
+        outputs = self.vlm_backbone(
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            image_grid_thw=image_grid_thw,
+            logits_to_keep=1,
+        )
 
-        # generation
-        output_actions = None
-        if not (self.training or states is None):
-            output_actions, outputs = self.sample_actions(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-                inputs_embeds=inputs_embeds,
-                cache_position=cache_position,
-                states=states,
-            )
-        else:
-            outputs = self.vlm_backbone.model(
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-                inputs_embeds=inputs_embeds,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=True,
-                cache_position=cache_position,
-            )
+        hidden_states = outputs.hidden_states
 
-        hidden_states = outputs[0]
-
-        # only compute necessary logits, do not upcast to float if not computing loss
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.vlm_backbone.lm_head(hidden_states[:, slice_indices, :])
-
-        loss = None
         fm_loss = None
         v_t = None
-        if actions is not None:
+        if action is not None:
             action_time_embs = hidden_states[action_mask[..., 0]]
             action_time_embs = action_time_embs.type(self.action_out_proj.dtype)
 
@@ -464,25 +378,11 @@ class EO1VisionFlowMatchingModel(nn.Module):
                 in_episode_bound = (~action_is_pad).reshape(-1, 1)
                 losses = losses * in_episode_bound
 
-            in_denoise_bound = (~pass_mask_in_action).reshape(-1, 1)
-            losses = losses * in_denoise_bound
-
             fm_loss = losses.mean()
-            loss = fm_loss
-
-        ar_loss = None
-        if labels is not None:
-            ar_loss = self.vlm_backbone.loss_function(
-                logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
-            )
-            loss = loss + ar_loss if loss is not None else ar_loss
 
         return EO1VisionFlowMatchingOutputWithPast(
-            loss=loss,
             fm_loss=fm_loss,
-            ar_loss=ar_loss,
-            actions=output_actions,
-            logits=logits,
+            logits=outputs.logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,

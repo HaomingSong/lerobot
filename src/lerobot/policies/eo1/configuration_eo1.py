@@ -38,14 +38,8 @@ class EO1Config(PreTrainedConfig):
 
     # If pretrained path not set, init from VLM huggingface repo.
     # vlm_base: str = "Qwen/Qwen2.5-VL-3B-Instruct"
-    vlm_base: str = "/mnt/inspurfs/evla2_t/vla_next_next/pretrained/Qwen2.5-VL-3B-Instruct"
+    vlm_base: str = "/mnt/inspurfs/evla2_t/eo-robotics/eo1_artifacts/Qwen2.5-VL-3B-Instruct"
     vlm_config: dict = field(default_factory=lambda: Qwen2_5_VLConfig().to_dict())
-
-    # EO1 architecture/token IDs.
-    vision_token_id: int = 151654
-    state_token_id: int = 151669
-    action_token_id: int = 151666
-    action_pass_id: int = 151672
 
     # Vision processor settings.
     image_min_pixels: int | None = 64 * 28 * 28

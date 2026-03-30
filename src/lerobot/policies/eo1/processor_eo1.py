@@ -100,7 +100,7 @@ class EO1ActionPaddingProcessorStep(PolicyActionProcessorStep):
 
     def _process_action(self, action):
         """Pad the action to the max_action_dim."""
-        processed_action = action.copy()
+        processed_action = action.clone()
         processed_action = pad_vector(processed_action, self.max_action_dim)
 
         return processed_action

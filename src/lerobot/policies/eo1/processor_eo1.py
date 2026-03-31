@@ -95,6 +95,16 @@ def pad_vector(vector, new_dim):
 class EO1ActionPaddingProcessorStep(PolicyActionProcessorStep):
     max_action_dim: int
 
+    def __call__(self, transition):
+        new_transition = transition.copy()
+        action = new_transition.get(TransitionKey.ACTION)
+
+        if action is None or not isinstance(action, torch.Tensor):
+            return new_transition
+
+        new_transition[TransitionKey.ACTION] = self.action(action)
+        return new_transition
+
     def action(self, action):
         return self._process_action(action)
 
@@ -186,7 +196,6 @@ class EO1ImageSmartResizeStep(ObservationProcessorStep):
     _resized_features: dict[str, PolicyFeature] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self):
-
         # Robust JSON deserialization handling (guard empty maps).
         if self.input_features:
             first_val = next(iter(self.input_features.values()))

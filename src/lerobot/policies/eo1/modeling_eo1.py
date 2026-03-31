@@ -72,7 +72,9 @@ class EO1Policy(PreTrainedPolicy):
 
         if config.pretrained_path is None:
             # Initialize from pretrained VLM
-            vlm_backbone = Qwen2_5_VLForConditionalGeneration.from_pretrained(config.vlm_base)
+            vlm_backbone = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                config.vlm_base, dtype=config.dtype
+            )
         else:
             vlm_config = config.get_vlm_config()
             vlm_backbone = Qwen2_5_VLForConditionalGeneration(vlm_config)
@@ -86,7 +88,6 @@ class EO1Policy(PreTrainedPolicy):
         self._action_queue = deque(maxlen=self.config.n_action_steps)
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
-
         state = batch.get(OBS_STATE)
         outputs = self.model(states=state, **batch)
 
@@ -188,29 +189,24 @@ class EO1VisionFlowMatchingModel(nn.Module):
         self.config = config
         hidden_size = config.text_config.hidden_size
         max_action_dim = config.max_action_dim
-        self.vlm_backbone = vlm_backbone
-        self.state_proj = nn.Linear(max_action_dim, hidden_size)
-        self.action_in_proj = nn.Linear(max_action_dim, hidden_size)
+        self.vlm_backbone = vlm_backbone.to(dtype=getattr(torch, config.dtype))
+        self.state_proj = nn.Linear(max_action_dim, hidden_size, dtype=torch.float32)
+        self.action_in_proj = nn.Linear(max_action_dim, hidden_size, dtype=torch.float32)
         self.action_out_proj = EO1VisionActionProjector(
             hidden_size,
             max_action_dim,
             config.num_action_layers,
             config.action_act,
+            dtype=torch.float32,
         )
-        self.action_time_mlp_in = nn.Linear(hidden_size * 2, hidden_size)
-        self.action_time_mlp_out = nn.Linear(hidden_size, hidden_size)
-
-        self.to_float32_flow_matching_head()
+        self.action_time_mlp_in = nn.Linear(hidden_size * 2, hidden_size, dtype=torch.float32)
+        self.action_time_mlp_out = nn.Linear(hidden_size, hidden_size, dtype=torch.float32)
 
     def get_input_embeddings(self):
         return self.vlm_backbone.get_input_embeddings()
 
-    def to_float32_flow_matching_head(self):
-        self.action_out_proj = self.action_out_proj.to(dtype=torch.float32)
-        self.action_time_mlp_in = self.action_time_mlp_in.to(dtype=torch.float32)
-        self.action_time_mlp_out = self.action_time_mlp_out.to(dtype=torch.float32)
-        self.state_proj = self.state_proj.to(dtype=torch.float32)
-        self.action_in_proj = self.action_in_proj.to(dtype=torch.float32)
+    def flow_head_autocast_context(self):
+        return torch.autocast(device_type=self.state_proj.weight.device.type, enabled=False)
 
     def sample_noise(self, shape, device):
         noise = torch.normal(
@@ -282,8 +278,9 @@ class EO1VisionFlowMatchingModel(nn.Module):
             inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
         if states is not None:
-            states = states.type(self.state_proj.weight.dtype)
-            state_embs = self.state_proj(states)
+            with self.flow_head_autocast_context():
+                states = states.to(dtype=torch.float32)
+                state_embs = self.state_proj(states)
             inputs_embeds, _ = self.replace_special_embeddings(
                 input_ids, inputs_embeds, state_embs, self.config.state_token_id
             )
@@ -295,20 +292,21 @@ class EO1VisionFlowMatchingModel(nn.Module):
         noisy_actions: torch.Tensor,
     ) -> torch.FloatTensor:
         """Embed the suffix"""
-        time_embs = create_sinusoidal_pos_embedding(
-            timestep,
-            self.config.text_config.hidden_size,
-            device=noisy_actions.device,
-        )
-        time_embs = time_embs.type(noisy_actions.dtype)
-        noisy_actions = noisy_actions.type(self.action_in_proj.weight.dtype)
-        action_embs = self.action_in_proj(noisy_actions)
-        time_embs = time_embs[:, None, :].expand_as(action_embs)
+        with self.flow_head_autocast_context():
+            noisy_actions = noisy_actions.to(dtype=self.action_in_proj.weight.dtype)
+            time_embs = create_sinusoidal_pos_embedding(
+                timestep,
+                self.config.text_config.hidden_size,
+                device=noisy_actions.device,
+            )
+            time_embs = time_embs.to(dtype=noisy_actions.dtype)
+            action_embs = self.action_in_proj(noisy_actions)
+            time_embs = time_embs[:, None, :].expand_as(action_embs)
 
-        action_time_embs = torch.cat([action_embs, time_embs], dim=2)
-        action_time_embs = self.action_time_mlp_in(action_time_embs)
-        action_time_embs = F.silu(action_time_embs)
-        action_time_embs = self.action_time_mlp_out(action_time_embs)
+            action_time_embs = torch.cat([action_embs, time_embs], dim=2)
+            action_time_embs = self.action_time_mlp_in(action_time_embs)
+            action_time_embs = F.silu(action_time_embs)
+            action_time_embs = self.action_time_mlp_out(action_time_embs)
         return action_time_embs
 
     def forward(
@@ -366,14 +364,13 @@ class EO1VisionFlowMatchingModel(nn.Module):
         fm_loss = None
         v_t = None
         if action is not None:
-            action_time_embs = hidden_states[action_mask[..., 0]]
-            action_time_embs = action_time_embs.type(self.action_out_proj.dtype)
+            with self.flow_head_autocast_context():
+                action_time_embs = hidden_states[action_mask[..., 0]].to(dtype=self.action_out_proj.dtype)
+                v_t = self.action_out_proj(action_time_embs)
+                u_t = u_t.reshape(v_t.shape)
+                v_t = v_t.to(dtype=u_t.dtype)
 
-            v_t = self.action_out_proj(action_time_embs)
-            u_t = u_t.reshape(v_t.shape)
-            v_t = v_t.type(u_t.dtype)
-
-            losses = F.mse_loss(u_t, v_t, reduction="none")
+                losses = F.mse_loss(u_t, v_t, reduction="none")
             if action_is_pad is not None:
                 in_episode_bound = (~action_is_pad).reshape(-1, 1)
                 losses = losses * in_episode_bound
@@ -434,7 +431,7 @@ class EO1VisionFlowMatchingModel(nn.Module):
         actions_shape = (states.shape[0], chunk_size, self.config.max_action_dim)
         noise = self.sample_noise(actions_shape, device)
 
-        x_t = noise.type(self.action_in_proj.weight.dtype)
+        x_t = noise.to(dtype=self.action_in_proj.weight.dtype)
         dt = torch.tensor(-1.0 / self.config.num_denoise_steps, device=device)
         time = torch.ones(inputs_embeds.shape[0], device=device)
         past_key_values = outputs.past_key_values
@@ -452,9 +449,11 @@ class EO1VisionFlowMatchingModel(nn.Module):
                 inputs_embeds=inputs_embeds[:, prefix_len:suffix_len],
                 use_cache=True,
             )
-            action_time_embs = outputs.last_hidden_state[:, :chunk_size]
-            action_time_embs = action_time_embs.type(self.action_out_proj.dtype)
-            v_t = self.action_out_proj(action_time_embs)
+            with self.flow_head_autocast_context():
+                action_time_embs = outputs.last_hidden_state[:, :chunk_size].to(
+                    dtype=self.action_out_proj.dtype
+                )
+                v_t = self.action_out_proj(action_time_embs)
 
             x_t += dt * v_t.reshape(x_t.shape)
             time += dt

@@ -256,7 +256,8 @@ class EO1VisionFlowMatchingModel(nn.Module):
         image_grid_thw: torch.LongTensor | None = None,
         video_grid_thw: torch.LongTensor | None = None,
         states: torch.Tensor | None = None,
-    ) -> tuple[torch.FloatTensor, torch.Tensor, torch.Tensor]:
+        state_token_id: int | None = None,
+    ) -> torch.FloatTensor:
         """Embed the suffix"""
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
@@ -282,7 +283,7 @@ class EO1VisionFlowMatchingModel(nn.Module):
                 states = states.to(dtype=torch.float32)
                 state_embs = self.state_proj(states)
             inputs_embeds, _ = self.replace_special_embeddings(
-                input_ids, inputs_embeds, state_embs, self.config.state_token_id
+                input_ids, inputs_embeds, state_embs, state_token_id
             )
         return inputs_embeds
 
@@ -318,16 +319,17 @@ class EO1VisionFlowMatchingModel(nn.Module):
         states: torch.Tensor | None = None,
         action: torch.Tensor | None = None,
         action_is_pad: torch.Tensor | None = None,
-        state_token_id: int = 151666,
-        action_token_id: int = 151669,
+        state_token_id: int = 151669,
+        action_token_id: int = 151666,
         **kwargs,
     ) -> EO1VisionFlowMatchingOutputWithPast:
         """multi-modal forward pass, including image, video, state, action, and language."""
         inputs_embeds = self.embed_prefix(
             input_ids,
-            pixel_values,
-            image_grid_thw,
-            states,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            states=states,
+            state_token_id=state_token_id,
         )
 
         if action is not None:
@@ -394,6 +396,8 @@ class EO1VisionFlowMatchingModel(nn.Module):
         pixel_values: torch.Tensor | None = None,
         image_grid_thw: torch.LongTensor | None = None,
         states: torch.Tensor | None = None,
+        state_token_id: int = 151669,
+        action_token_id: int = 151666,
         **kwargs,
     ) -> Tensor:
         """Sample actions from the model."""
@@ -411,6 +415,7 @@ class EO1VisionFlowMatchingModel(nn.Module):
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
             states=states,
+            state_token_id=state_token_id,
         )
 
         # pass prefix, update kvcache
@@ -436,7 +441,7 @@ class EO1VisionFlowMatchingModel(nn.Module):
         time = torch.ones(inputs_embeds.shape[0], device=device)
         past_key_values = outputs.past_key_values
 
-        action_mask = input_ids == self.config.action_token_id
+        action_mask = input_ids == action_token_id
         while time >= -dt / 2:
             action_time_embs = self.embed_suffix(time, x_t)
             inputs_embeds[action_mask] = action_time_embs.to(inputs_embeds.dtype)

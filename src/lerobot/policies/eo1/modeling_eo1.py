@@ -41,11 +41,11 @@ logger = logging.getLogger(__name__)
 @dataclass
 class EO1VisionFlowMatchingOutputWithPast(ModelOutput):
     fm_loss: torch.FloatTensor | None = None
-    logits: torch.FloatTensor | None = None
-    past_key_values: list[torch.FloatTensor] | None = None
-    hidden_states: torch.FloatTensor | None = None
-    attentions: torch.FloatTensor | None = None
-    rope_deltas: torch.LongTensor | None = None
+    # logits: torch.FloatTensor | None = None
+    # past_key_values: list[torch.FloatTensor] | None = None
+    # hidden_states: torch.FloatTensor | None = None
+    # attentions: torch.FloatTensor | None = None
+    # rope_deltas: torch.LongTensor | None = None
 
 
 def pad_vector(vector, new_dim):
@@ -353,15 +353,24 @@ class EO1VisionFlowMatchingModel(nn.Module):
         if attention_mask is not None:
             attention_mask = attention_mask.to(inputs_embeds.device)
 
-        # HACK: avoid forward pass in lm_head of vlm_backbone
-        outputs = self.vlm_backbone(
+        # Training only needs the final hidden states for the action tokens.
+        # Avoid the CausalLM wrapper here so we do not materialize lm_head logits,
+        # full-layer hidden states, or KV cache during every train step.
+        position_ids, _ = self.vlm_backbone.get_rope_index(
+            input_ids,
+            image_grid_thw=image_grid_thw,
+            attention_mask=attention_mask,
+        )
+        outputs = self.vlm_backbone.model(
+            position_ids=position_ids,
             attention_mask=attention_mask,
             inputs_embeds=inputs_embeds,
-            image_grid_thw=image_grid_thw,
-            logits_to_keep=1,
+            use_cache=False,
+            output_hidden_states=False,
+            return_dict=True,
         )
 
-        hidden_states = outputs.hidden_states
+        hidden_states = outputs.last_hidden_state
 
         fm_loss = None
         v_t = None
@@ -381,11 +390,6 @@ class EO1VisionFlowMatchingModel(nn.Module):
 
         return EO1VisionFlowMatchingOutputWithPast(
             fm_loss=fm_loss,
-            logits=outputs.logits,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-            rope_deltas=self.vlm_backbone.rope_deltas,
         )
 
     @torch.no_grad()

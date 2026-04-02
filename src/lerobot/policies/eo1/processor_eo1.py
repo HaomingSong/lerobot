@@ -32,7 +32,6 @@ from lerobot.processor import (
     NormalizerProcessorStep,
     ObservationProcessorStep,
     PolicyAction,
-    PolicyActionProcessorStep,
     PolicyProcessorPipeline,
     ProcessorStep,
     ProcessorStepRegistry,
@@ -42,7 +41,6 @@ from lerobot.processor import (
 from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
 from lerobot.processor.core import TransitionKey
 from lerobot.utils.constants import (
-    ACTION,
     OBS_STATE,
     POLICY_POSTPROCESSOR_DEFAULT_NAME,
     POLICY_PREPROCESSOR_DEFAULT_NAME,
@@ -76,110 +74,6 @@ def get_image_info(image_path, min_pixel, max_pixel, width, height):
 
     image_input, _ = process_vision_info(messages)
     return image_input[0]
-
-
-def pad_vector(vector, new_dim):
-    """Can be (b s e) or (b e)"""
-    if vector.shape[-1] == new_dim:
-        return vector
-    shape = list(vector.shape)
-    current_dim = shape[-1]
-    shape[-1] = new_dim
-    new_vector = torch.zeros(*shape, dtype=vector.dtype, device=vector.device)
-    new_vector[..., :current_dim] = vector
-    return new_vector
-
-
-@dataclass
-@ProcessorStepRegistry.register(name="eo1_action_padding_processor")
-class EO1ActionPaddingProcessorStep(PolicyActionProcessorStep):
-    max_action_dim: int
-
-    def __call__(self, transition):
-        new_transition = transition.copy()
-        action = new_transition.get(TransitionKey.ACTION)
-
-        if action is None or not isinstance(action, torch.Tensor):
-            return new_transition
-
-        new_transition[TransitionKey.ACTION] = self.action(action)
-        return new_transition
-
-    def action(self, action):
-        return self._process_action(action)
-
-    def _process_action(self, action):
-        """Pad the action to the max_action_dim."""
-        processed_action = action.clone()
-        processed_action = pad_vector(processed_action, self.max_action_dim)
-
-        return processed_action
-
-    def get_config(self) -> dict[str, Any]:
-        return {"max_action_dim": self.max_action_dim}
-
-    def transform_features(
-        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
-    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
-        """Pad the action to the max_action_dim.
-        Args:
-            features: The input feature dictionary.
-
-        Returns:
-            The feature dictionary with the action padded to the max_action_dim.
-        """
-        action_feature = features[PipelineFeatureType.ACTION].get(ACTION)
-        if action_feature:
-            shape = list(action_feature.shape)
-            shape[-1] = self.max_action_dim
-            pad_shape = tuple(shape)
-            features[PipelineFeatureType.ACTION][ACTION] = PolicyFeature(
-                type=FeatureType.ACTION, shape=pad_shape
-            )
-        return features
-
-
-@dataclass
-@ProcessorStepRegistry.register(name="eo1_state_padding_processor")
-class EO1StatePaddingProcessorStep(ObservationProcessorStep):
-    max_state_dim: int
-
-    def observation(self, observation):
-        return self._process_observation(observation)
-
-    def _process_observation(self, observation):
-        """Pad the state to the max_state_dim."""
-
-        processed_obs = observation.copy()
-        if OBS_STATE not in processed_obs:
-            return processed_obs
-        states = processed_obs.pop(OBS_STATE)
-        states = pad_vector(states, self.max_state_dim)
-        processed_obs[OBS_STATE] = states
-        return processed_obs
-
-    def get_config(self) -> dict[str, Any]:
-        return {"max_state_dim": self.max_state_dim}
-
-    def transform_features(
-        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
-    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
-        """Pad the state to the max_state_dim.
-        Args:
-            features: The input feature dictionary.
-
-        Returns:
-            The feature dictionary with the state padded to the max_state_dim.
-        """
-        state_feature = features[PipelineFeatureType.OBSERVATION].get(OBS_STATE)
-        if state_feature:
-            shape = list(state_feature.shape)
-            shape[-1] = self.max_state_dim
-            pad_shape = tuple(shape)
-            features[PipelineFeatureType.OBSERVATION][OBS_STATE] = PolicyFeature(
-                type=FeatureType.STATE, shape=pad_shape
-            )
-        return features
 
 
 @dataclass
@@ -457,8 +351,6 @@ def make_eo1_pre_post_processors(
             image_resized_height=config.image_resized_height,
             size_factor=IMAGE_FACTOR,
         ),
-        EO1ActionPaddingProcessorStep(max_action_dim=config.max_action_dim),
-        EO1StatePaddingProcessorStep(max_state_dim=config.max_state_dim),
         EO1ConversationTemplateStep(input_features=config.input_features, chunk_size=config.chunk_size),
         EO1QwenProcessorStep(processor_name=config.vlm_base),
         DeviceProcessorStep(device=config.device),

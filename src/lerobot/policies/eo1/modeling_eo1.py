@@ -88,8 +88,10 @@ class EO1Policy(PreTrainedPolicy):
         self._action_queue = deque(maxlen=self.config.n_action_steps)
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
-        state = batch.get(OBS_STATE)
-        outputs = self.model(states=state, **batch)
+        state = self.prepare_state(batch.get(OBS_STATE))
+        actions = self.prepare_action(batch.get(ACTION))
+        model_inputs = {k: v for k, v in batch.items() if k not in {OBS_STATE, ACTION}}
+        outputs = self.model(states=state, action=actions, **model_inputs)
 
         loss = outputs.fm_loss
 
@@ -100,16 +102,24 @@ class EO1Policy(PreTrainedPolicy):
     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs) -> Tensor:
         self.eval()
 
-        # HACK: move to processor
         # Prepare inputs
-        state = self.prepare_state(batch)
-        batch[OBS_STATE] = state
-        actions = self.model.sample_actions(**batch).to(torch.float32)
+        states = self.prepare_state(batch.get(OBS_STATE))
+        model_inputs = {k: v for k, v in batch.items() if k != OBS_STATE}
+        actions = self.model.sample_actions(states=states, **model_inputs).to(torch.float32)
 
-        # HACK: move to processor
         # Unpad actions to actual action dimension
         original_action_dim = self.config.output_features[ACTION].shape[0]
         return actions[:, :, :original_action_dim]
+
+    def prepare_state(self, state):
+        """Pad state"""
+        state = pad_vector(state, self.config.max_state_dim)
+        return state
+
+    def prepare_action(self, action):
+        """Pad action"""
+        actions = pad_vector(action, self.config.max_action_dim)
+        return actions
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
@@ -188,9 +198,10 @@ class EO1VisionFlowMatchingModel(nn.Module):
 
         self.config = config
         hidden_size = config.text_config.hidden_size
+        max_state_dim = config.max_state_dim
         max_action_dim = config.max_action_dim
         self.vlm_backbone = vlm_backbone.to(dtype=getattr(torch, config.dtype))
-        self.state_proj = nn.Linear(max_action_dim, hidden_size, dtype=torch.float32)
+        self.state_proj = nn.Linear(max_state_dim, hidden_size, dtype=torch.float32)
         self.action_in_proj = nn.Linear(max_action_dim, hidden_size, dtype=torch.float32)
         self.action_out_proj = EO1VisionActionProjector(
             hidden_size,

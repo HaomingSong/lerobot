@@ -32,22 +32,21 @@ from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.factory import make_dataset
 from lerobot.datasets.sampler import EpisodeAwareSampler
 from lerobot.datasets.utils import dataset_to_policy_features
-from lerobot.policies.factory import make_policy_config
 from lerobot.policies.eo1.processor_eo1 import (
     ACTION_END_TOKEN,
     ACTION_START_TOKEN,
     DEFAULT_ACTION_TOKEN,
     DEFAULT_STATE_TOKEN,
-    EO1ActionPaddingProcessorStep,
-    EO1ConversationTemplateStep,
-    EO1ImageSmartResizeStep,
-    EO1QwenProcessorStep,
     STATE_END_TOKEN,
     STATE_START_TOKEN,
     SYSTEM_MESSAGE,
     TASK_VLA_TOKEN,
+    EO1ConversationTemplateStep,
+    EO1ImageSmartResizeStep,
+    EO1QwenProcessorStep,
     make_eo1_pre_post_processors,
 )
+from lerobot.policies.factory import make_policy_config
 from lerobot.processor import TransitionKey
 from lerobot.utils.constants import ACTION, OBS_STATE
 
@@ -277,8 +276,8 @@ def _assert_processed_batch(
     raw_action = raw_batch[ACTION]
     raw_state = raw_batch[OBS_STATE]
 
-    assert processed_batch[ACTION].shape == (*raw_action.shape[:-1], cfg.policy.max_action_dim)
-    assert processed_batch[OBS_STATE].shape == (*raw_state.shape[:-1], cfg.policy.max_state_dim)
+    assert processed_batch[ACTION].shape == raw_action.shape
+    assert processed_batch[OBS_STATE].shape == raw_state.shape
     assert torch.equal(processed_batch["action_is_pad"], raw_batch["action_is_pad"])
     assert processed_batch["task"] == raw_batch["task"]
 
@@ -299,20 +298,17 @@ def _assert_processed_batch(
     expected_state = (raw_state - state_mean) / (state_std + 1e-8)
 
     torch.testing.assert_close(
-        processed_batch[ACTION][..., : raw_action.shape[-1]].cpu(),
+        processed_batch[ACTION].cpu(),
         expected_action.cpu(),
         rtol=1e-4,
         atol=1e-4,
     )
     torch.testing.assert_close(
-        processed_batch[OBS_STATE][..., : raw_state.shape[-1]].cpu(),
+        processed_batch[OBS_STATE].cpu(),
         expected_state.cpu(),
         rtol=1e-4,
         atol=1e-4,
     )
-
-    assert torch.count_nonzero(processed_batch[ACTION][..., raw_action.shape[-1] :]).item() == 0
-    assert torch.count_nonzero(processed_batch[OBS_STATE][..., raw_state.shape[-1] :]).item() == 0
 
     for key in camera_keys:
         expected_shape = tuple(resized_features[key])
@@ -335,22 +331,6 @@ def _assert_processed_batch(
     action_token_id = processed_batch["action_token_id"]
     assert torch.all((input_ids == state_token_id).sum(dim=1) == 1)
     assert torch.all((input_ids == action_token_id).sum(dim=1) == cfg.policy.chunk_size)
-
-
-def test_eo1_action_padding_skips_missing_action():
-    step = EO1ActionPaddingProcessorStep(max_action_dim=32)
-    transition = {
-        TransitionKey.OBSERVATION: {OBS_STATE: torch.zeros(1, 8)},
-        TransitionKey.ACTION: None,
-    }
-
-    processed_transition = step(transition)
-
-    assert processed_transition[TransitionKey.ACTION] is None
-    torch.testing.assert_close(
-        processed_transition[TransitionKey.OBSERVATION][OBS_STATE],
-        transition[TransitionKey.OBSERVATION][OBS_STATE],
-    )
 
 
 def test_eo1_processor_pipeline_with_libero_dataset():

@@ -49,8 +49,8 @@ class EO1Config(PreTrainedConfig):
 
     # Execution and action horizon.
     n_obs_steps: int = 1
-    chunk_size: int = 16
-    n_action_steps: int = 16
+    chunk_size: int = 8
+    n_action_steps: int = 8
 
     # State/action padding to match EO1 flow head dimensionality.
     max_state_dim: int = 32
@@ -72,19 +72,19 @@ class EO1Config(PreTrainedConfig):
         }
     )
 
-    # Optimizer settings: see openpi `AdamW``
-    optimizer_lr: float = 2.5e-5  # see openpi `CosineDecaySchedule: peak_lr`
-    optimizer_betas: tuple[float, float] = (0.9, 0.95)
+    # Optimizer settings aligned with EO1/experiments/2_libero/train.sh and EO1 TrainPipelineConfig defaults.
+    optimizer_lr: float = 1e-4
+    optimizer_betas: tuple[float, float] = (0.9, 0.999)
     optimizer_eps: float = 1e-8
-    optimizer_weight_decay: float = 0.01
+    optimizer_weight_decay: float = 0.1
     optimizer_grad_clip_norm: float = 1.0
 
-    # Scheduler settings: see openpi `CosineDecaySchedule`
+    # Scheduler settings aligned with EO1 train.sh: cosine schedule with warmup_ratio=0.03.
     # Note: These will auto-scale if --steps < scheduler_decay_steps
     # For example, --steps=3000 will scale warmup to 100 and decay to 3000
-    scheduler_warmup_steps: int = 1_000
+    scheduler_warmup_steps: int = 900  # 0.03 * 30_000 long-run steps
     scheduler_decay_steps: int = 30_000
-    scheduler_decay_lr: float = 2.5e-6
+    scheduler_decay_lr: float = 0.0
 
     def __post_init__(self):
         super().__post_init__()

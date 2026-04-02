@@ -71,6 +71,7 @@ class EO1Config(PreTrainedConfig):
             "ACTION": NormalizationMode.MEAN_STD,
         }
     )
+    rename_map: dict[str, str] = field(default_factory=dict)
 
     # Optimizer settings aligned with EO1/experiments/2_libero/train.sh and EO1 TrainPipelineConfig defaults.
     optimizer_lr: float = 1e-4

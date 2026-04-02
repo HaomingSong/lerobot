@@ -336,7 +336,7 @@ def make_eo1_pre_post_processors(
     """Build pre/post processor pipelines for EO1."""
 
     input_steps: list[ProcessorStep] = [
-        RenameObservationsProcessorStep(rename_map={}),
+        RenameObservationsProcessorStep(rename_map=config.rename_map),
         AddBatchDimensionProcessorStep(),
         NormalizerProcessorStep(
             features={**config.input_features, **config.output_features},

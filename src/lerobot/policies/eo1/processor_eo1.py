@@ -292,10 +292,14 @@ class EO1QwenProcessorStep(ComplementaryDataProcessorStep):
         if messages is None:
             raise ValueError("Messages are required for EO1QwenProcessorStep.")
 
+        # left padding for batch inference, right padding for training
+        padding_side = "right" if self.transition.get(TransitionKey.ACTION) is not None else "left"
+
         inputs = self._processor.apply_chat_template(
             messages,
             tokenize=True,
             padding=True,
+            padding_side=padding_side,
             do_resize=False,
             add_generation_prompt=False,
             return_dict=True,

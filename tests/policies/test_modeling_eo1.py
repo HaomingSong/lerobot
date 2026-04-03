@@ -283,6 +283,96 @@ def test_eo1_sample_actions_supports_batched_eval_denoising():
         )
 
 
+def test_eo1_sample_actions_supports_single_sample_eval_denoising():
+    config = make_test_config(dtype="bfloat16", chunk_size=4, n_action_steps=4, num_denoise_steps=2)
+    model = EO1VisionFlowMatchingModel(config, DummyVLMBackbone(config.text_config.hidden_size))
+
+    action_token_id = 7
+    state_token_id = 9
+    input_ids = torch.tensor(
+        [[0, 0, state_token_id, 21, action_token_id, action_token_id, action_token_id, action_token_id]]
+    )
+    attention_mask = torch.tensor([[0, 0, 1, 1, 1, 1, 1, 1]], dtype=torch.long)
+    states = torch.randn(1, config.max_state_dim, dtype=torch.float32)
+
+    actions = model.sample_actions(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        states=states,
+        state_token_id=state_token_id,
+        action_token_id=action_token_id,
+    )
+
+    assert actions.shape == (1, config.chunk_size, config.max_action_dim)
+    assert len(model.vlm_backbone.model_calls) == 1 + config.num_denoise_steps
+
+
+def test_eo1_sample_actions_uses_aligned_left_padded_eval_prompts():
+    config = make_test_config(dtype="bfloat16", chunk_size=4, n_action_steps=4, num_denoise_steps=2)
+    model = EO1VisionFlowMatchingModel(config, DummyVLMBackbone(config.text_config.hidden_size))
+
+    action_token_id = 7
+    input_ids = torch.tensor(
+        [
+            [0, 0, 101, 102, 103, 7, 7, 7, 7, 201],
+            [111, 112, 113, 114, 115, 7, 7, 7, 7, 202],
+        ],
+        dtype=torch.long,
+    )
+    attention_mask = torch.tensor(
+        [
+            [0, 0, 1, 1, 1, 1, 1, 1, 1, 1],
+            [1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+        ],
+        dtype=torch.long,
+    )
+
+    actions = model.sample_actions(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        action_token_id=action_token_id,
+    )
+
+    assert actions.shape == (2, config.chunk_size, config.max_action_dim)
+    assert len(model.vlm_backbone.model_calls) == 1 + config.num_denoise_steps
+
+    prefill, step_0, step_1 = model.vlm_backbone.model_calls
+    assert prefill["inputs_embeds"].shape == (2, 5, config.text_config.hidden_size)
+    assert prefill["attention_mask"][0].tolist() == [0, 0, 1, 1, 1]
+    assert prefill["attention_mask"][1].tolist() == [1, 1, 1, 1, 1]
+    assert step_0["inputs_embeds"].shape[1] == config.chunk_size
+    assert step_0["attention_mask"].shape[1] == 9
+    assert step_1["attention_mask"].shape[1] == 9
+
+
+def test_eo1_sample_actions_raises_for_misaligned_action_spans():
+    config = make_test_config(dtype="bfloat16", chunk_size=4, n_action_steps=4, num_denoise_steps=2)
+    model = EO1VisionFlowMatchingModel(config, DummyVLMBackbone(config.text_config.hidden_size))
+
+    action_token_id = 7
+    input_ids = torch.tensor(
+        [
+            [101, 102, 103, 7, 7, 7, 7, 201, 202, 0, 0, 0],
+            [111, 112, 113, 114, 115, 7, 7, 7, 7, 211, 212, 213],
+        ],
+        dtype=torch.long,
+    )
+    attention_mask = torch.tensor(
+        [
+            [1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0],
+            [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+        ],
+        dtype=torch.long,
+    )
+
+    with pytest.raises(ValueError, match="share the same contiguous action token span"):
+        model.sample_actions(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            action_token_id=action_token_id,
+        )
+
+
 def test_eo1_state_dict_keeps_flow_head_weights_in_fp32():
     config = make_test_config(dtype="bfloat16")
     model = EO1VisionFlowMatchingModel(config, DummyVLMBackbone(config.text_config.hidden_size))

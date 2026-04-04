@@ -92,6 +92,16 @@ from lerobot.utils.utils import (
 )
 
 
+def post_process_libero_gripper_action(action: Tensor) -> Tensor:
+    """Remap the final gripper dimension to match the original EO1 LIBERO eval path."""
+    if action.shape[-1] < 1:
+        raise ValueError("Expected action tensor with at least one dimension for LIBERO gripper postprocess.")
+
+    action = action.clone()
+    action[..., -1] = 2 * (1 - action[..., -1]) - 1
+    return action
+
+
 def rollout(
     env: gym.vector.VectorEnv,
     policy: PreTrainedPolicy,
@@ -102,6 +112,7 @@ def rollout(
     seeds: list[int] | None = None,
     return_observations: bool = False,
     render_callback: Callable[[gym.vector.VectorEnv], None] | None = None,
+    libero_gripper_postprocess: bool = False,
 ) -> dict:
     """Run a batched policy rollout once through a batch of environments.
 
@@ -180,6 +191,8 @@ def rollout(
         action_transition = {ACTION: action}
         action_transition = env_postprocessor(action_transition)
         action = action_transition[ACTION]
+        if libero_gripper_postprocess:
+            action = post_process_libero_gripper_action(action)
 
         # Convert to CPU / numpy.
         action_numpy: np.ndarray = action.to("cpu").numpy()
@@ -259,6 +272,7 @@ def eval_policy(
     videos_dir: Path | None = None,
     return_episode_data: bool = False,
     start_seed: int | None = None,
+    libero_gripper_postprocess: bool = False,
 ) -> dict:
     """
     Args:
@@ -346,6 +360,7 @@ def eval_policy(
             seeds=list(seeds) if seeds else None,
             return_observations=return_episode_data,
             render_callback=render_frame if max_episodes_rendered > 0 else None,
+            libero_gripper_postprocess=libero_gripper_postprocess,
         )
 
         # Figure out where in each rollout sequence the first done condition was encountered (results after
@@ -547,6 +562,13 @@ def eval_main(cfg: EvalPipelineConfig):
 
     # Create environment-specific preprocessor and postprocessor (e.g., for LIBERO environments)
     env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg=cfg.env, policy_cfg=cfg.policy)
+    libero_gripper_postprocess = cfg.libero_gripper_postprocess
+    if libero_gripper_postprocess and cfg.env.type != "libero":
+        logging.warning(
+            "Ignoring `libero_gripper_postprocess=true` because env.type=%s is not LIBERO.",
+            cfg.env.type,
+        )
+        libero_gripper_postprocess = False
 
     with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
         info = eval_policy_all(
@@ -561,6 +583,7 @@ def eval_main(cfg: EvalPipelineConfig):
             videos_dir=Path(cfg.output_dir) / "videos",
             start_seed=cfg.seed,
             max_parallel_tasks=cfg.env.max_parallel_tasks,
+            libero_gripper_postprocess=libero_gripper_postprocess,
         )
         print("Overall Aggregated Metrics:")
         print(info["overall"])
@@ -603,6 +626,7 @@ def eval_one(
     videos_dir: Path | None,
     return_episode_data: bool,
     start_seed: int | None,
+    libero_gripper_postprocess: bool = False,
 ) -> TaskMetrics:
     """Evaluates one task_id of one suite using the provided vec env."""
 
@@ -620,6 +644,7 @@ def eval_one(
         videos_dir=task_videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        libero_gripper_postprocess=libero_gripper_postprocess,
     )
 
     per_episode = task_result["per_episode"]
@@ -646,6 +671,7 @@ def run_one(
     videos_dir: Path | None,
     return_episode_data: bool,
     start_seed: int | None,
+    libero_gripper_postprocess: bool = False,
 ):
     """
     Run eval_one for a single (task_group, task_id, env).
@@ -670,6 +696,7 @@ def run_one(
         videos_dir=task_videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        libero_gripper_postprocess=libero_gripper_postprocess,
     )
     # ensure we always provide video_paths key to simplify accumulation
     if max_episodes_rendered > 0:
@@ -691,6 +718,7 @@ def eval_policy_all(
     return_episode_data: bool = False,
     start_seed: int | None = None,
     max_parallel_tasks: int = 1,
+    libero_gripper_postprocess: bool = False,
 ) -> dict:
     """
     Evaluate a nested `envs` dict: {task_group: {task_id: vec_env}}.
@@ -746,6 +774,7 @@ def eval_policy_all(
         videos_dir=videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        libero_gripper_postprocess=libero_gripper_postprocess,
     )
 
     if max_parallel_tasks <= 1:

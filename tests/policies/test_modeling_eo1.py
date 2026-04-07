@@ -365,7 +365,7 @@ def test_eo1_sample_actions_raises_for_misaligned_action_spans():
         dtype=torch.long,
     )
 
-    with pytest.raises(ValueError, match="share the same contiguous action token span"):
+    with pytest.raises(ValueError, match="same action token mask after left padding"):
         model.sample_actions(
             input_ids=input_ids,
             attention_mask=attention_mask,

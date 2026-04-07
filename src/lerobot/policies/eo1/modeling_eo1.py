@@ -280,93 +280,6 @@ class EO1VisionFlowMatchingModel(nn.Module):
         valid_elements = valid_mask.sum() * losses.shape[-1]
         return valid_losses.sum() / valid_elements.clamp_min(1)
 
-    @staticmethod
-    def get_action_token_spans(
-        input_ids: torch.LongTensor,
-        action_token_id: int,
-        chunk_size: int,
-    ) -> list[tuple[int, int]]:
-        action_mask = input_ids == action_token_id
-        spans: list[tuple[int, int]] = []
-
-        for batch_idx in range(input_ids.shape[0]):
-            action_positions = torch.nonzero(action_mask[batch_idx], as_tuple=False).flatten()
-            if action_positions.numel() != chunk_size:
-                raise ValueError(
-                    f"Expected {chunk_size} action tokens in sample {batch_idx}, "
-                    f"but found {action_positions.numel()}."
-                )
-
-            first_action_idx = int(action_positions[0].item())
-            last_action_idx = int(action_positions[-1].item())
-            if last_action_idx - first_action_idx + 1 != chunk_size:
-                raise ValueError(
-                    f"Action tokens for sample {batch_idx} must form one contiguous span, "
-                    f"but got positions {action_positions.tolist()}."
-                )
-
-            spans.append((first_action_idx, last_action_idx + 1))
-
-        return spans
-
-    def _sample_actions_with_span(
-        self,
-        position_ids: torch.LongTensor,
-        attention_mask: torch.Tensor,
-        inputs_embeds: torch.FloatTensor,
-        prefix_len: int,
-        suffix_end: int,
-    ) -> Tensor:
-        chunk_size = self.config.chunk_size
-        if suffix_end - prefix_len != chunk_size:
-            raise ValueError(
-                f"Action span length ({suffix_end - prefix_len}) does not match chunk_size ({chunk_size})."
-            )
-
-        inputs_embeds = inputs_embeds.clone()
-        outputs = self.vlm_backbone.model(
-            position_ids=position_ids[..., :prefix_len],
-            attention_mask=attention_mask[:, :prefix_len],
-            inputs_embeds=inputs_embeds[:, :prefix_len],
-            use_cache=True,
-        )
-
-        device = inputs_embeds.device
-        actions_shape = (inputs_embeds.shape[0], chunk_size, self.config.max_action_dim)
-        noise = self.sample_noise(actions_shape, device)
-
-        x_t = noise.to(dtype=self.action_in_proj.weight.dtype)
-        dt = -1.0 / self.config.num_denoise_steps
-        batch_size = inputs_embeds.shape[0]
-        past_key_values = outputs.past_key_values
-
-        for step in range(self.config.num_denoise_steps):
-            time = torch.full(
-                (batch_size,),
-                1.0 + step * dt,
-                device=device,
-                dtype=torch.float32,
-            )
-            action_time_embs = self.embed_suffix(time, x_t)
-            inputs_embeds[:, prefix_len:suffix_end] = action_time_embs.to(inputs_embeds.dtype)
-
-            past_key_values.crop(prefix_len)
-            outputs = self.vlm_backbone.model(
-                position_ids=position_ids[..., prefix_len:suffix_end],
-                attention_mask=attention_mask[:, :suffix_end],
-                past_key_values=past_key_values,
-                inputs_embeds=inputs_embeds[:, prefix_len:suffix_end],
-                use_cache=True,
-            )
-            with self.flow_head_autocast_context():
-                action_time_embs = outputs.last_hidden_state[:, :chunk_size].to(
-                    dtype=self.action_out_proj.dtype
-                )
-                v_t = self.action_out_proj(action_time_embs)
-
-            x_t += dt * v_t.reshape(x_t.shape)
-        return x_t
-
     def replace_special_embeddings(
         self,
         input_ids: torch.LongTensor,
@@ -539,43 +452,74 @@ class EO1VisionFlowMatchingModel(nn.Module):
         **kwargs,
     ) -> Tensor:
         """Sample actions from the model."""
+        chunk_size = self.config.chunk_size
 
-        # prepare position_ids and kv_cache
+        action_mask = input_ids == action_token_id
+        if action_mask.ne(action_mask[:1]).any():
+            raise ValueError(
+                "Batch inference expects all samples to share the same action token mask after left padding."
+            )
+
+        act_start = int(action_mask[0].to(torch.int64).argmax().item())
+        act_end = act_start + chunk_size
+        act_slice = slice(act_start, act_end)
+
         position_ids, _ = self.vlm_backbone.get_rope_index(
             input_ids,
             image_grid_thw=image_grid_thw,
             attention_mask=attention_mask,
         )
-
-        # embed prefix
         inputs_embeds = self.embed_prefix(
             input_ids,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
             states=states,
             state_token_id=state_token_id,
+        ).clone()
+
+        batch_size = input_ids.shape[0]
+        device = inputs_embeds.device
+        attention_mask = attention_mask.to(device)
+        position_ids = position_ids.to(device)
+
+        outputs = self.vlm_backbone.model(
+            position_ids=position_ids[..., :act_start],
+            attention_mask=attention_mask[:, :act_start],
+            inputs_embeds=inputs_embeds[:, :act_start],
+            use_cache=True,
         )
 
-        chunk_size = self.config.chunk_size
-        if attention_mask is None:
-            attention_mask = torch.ones_like(input_ids)
-        else:
-            attention_mask = attention_mask.to(inputs_embeds.device)
+        x_t = self.sample_noise(
+            (batch_size, chunk_size, self.config.max_action_dim),
+            device,
+        ).to(dtype=self.action_in_proj.weight.dtype)
+        dt = -1.0 / self.config.num_denoise_steps
+        past_key_values = outputs.past_key_values
 
-        action_spans = self.get_action_token_spans(input_ids, action_token_id, chunk_size)
-        prefix_len, suffix_end = action_spans[0]
-        if any(span != (prefix_len, suffix_end) for span in action_spans[1:]):
-            raise ValueError(
-                "Batch inference expects all samples to share the same contiguous action token span, "
-                f"but found spans {action_spans}."
+        for step in range(self.config.num_denoise_steps):
+            time = torch.full(
+                (batch_size,),
+                1.0 + step * dt,
+                device=device,
+                dtype=torch.float32,
             )
-        return self._sample_actions_with_span(
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            inputs_embeds=inputs_embeds,
-            prefix_len=prefix_len,
-            suffix_end=suffix_end,
-        )
+            action_time_embs = self.embed_suffix(time, x_t)
+            inputs_embeds[:, act_slice] = action_time_embs.to(inputs_embeds.dtype)
+
+            outputs = self.vlm_backbone.model(
+                position_ids=position_ids[..., act_slice],
+                attention_mask=attention_mask[:, :act_end],
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds[:, act_slice],
+                use_cache=True,
+            )
+            with self.flow_head_autocast_context():
+                hidden_states = outputs.last_hidden_state[:, :chunk_size].to(dtype=self.action_out_proj.dtype)
+                v_t = self.action_out_proj(hidden_states)
+
+            x_t += dt * v_t.reshape(x_t.shape)
+
+        return x_t
 
     def prepare_inputs_for_generation(self, *args, **kwargs):
         return self.vlm_backbone.prepare_inputs_for_generation(*args, **kwargs)

@@ -22,6 +22,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint
 
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.policies.eo1.configuration_eo1 import EO1Config
@@ -41,6 +42,8 @@ class DummyVLMBackbone(nn.Module):
         self.gradient_checkpointing = False
         self.gradient_checkpointing_enable_calls: list[dict[str, object] | None] = []
         self.gradient_checkpointing_disable_calls = 0
+        self.image_feature_calls: list[dict[str, object]] = []
+        self.video_feature_calls: list[dict[str, object]] = []
 
     def get_input_embeddings(self):
         return self.embedding
@@ -62,6 +65,47 @@ class DummyVLMBackbone(nn.Module):
         batch_size, seq_len = input_ids.shape
         position_ids = torch.arange(seq_len, device=input_ids.device).view(1, 1, -1).expand(3, batch_size, -1)
         return position_ids, None
+
+    def get_image_features(
+        self,
+        pixel_values: torch.Tensor,
+        image_grid_thw: torch.Tensor | None = None,
+    ) -> list[torch.Tensor]:
+        self.image_feature_calls.append({"pixel_values": pixel_values, "image_grid_thw": image_grid_thw})
+        batch_size = pixel_values.shape[0]
+        hidden_size = self.embedding.embedding_dim
+        return [
+            torch.ones(1, hidden_size, dtype=self.embedding.weight.dtype, device=pixel_values.device)
+        ] * batch_size
+
+    def get_video_features(
+        self,
+        pixel_values_videos: torch.Tensor,
+        video_grid_thw: torch.Tensor | None = None,
+    ) -> list[torch.Tensor]:
+        self.video_feature_calls.append(
+            {"pixel_values_videos": pixel_values_videos, "video_grid_thw": video_grid_thw}
+        )
+        batch_size = pixel_values_videos.shape[0]
+        hidden_size = self.embedding.embedding_dim
+        return [
+            torch.ones(1, hidden_size, dtype=self.embedding.weight.dtype, device=pixel_values_videos.device)
+        ] * batch_size
+
+    def get_placeholder_mask(
+        self,
+        input_ids: torch.LongTensor,
+        inputs_embeds: torch.FloatTensor,
+        image_features: torch.FloatTensor = None,
+        video_features: torch.FloatTensor = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        image_mask = torch.zeros_like(inputs_embeds, dtype=torch.bool)
+        video_mask = torch.zeros_like(inputs_embeds, dtype=torch.bool)
+        if image_features is not None:
+            image_mask[:, 0, :] = True
+        if video_features is not None:
+            video_mask[:, 0, :] = True
+        return image_mask, video_mask
 
     def model(
         self,
@@ -119,6 +163,19 @@ def make_test_config(**overrides) -> EO1Config:
     if not qwen_root.exists():
         pytest.skip(f"EO1 Qwen checkpoint not found: {qwen_root}")
     return EO1Config(vlm_base=str(qwen_root), **overrides)
+
+
+def patch_checkpoint_to_record(monkeypatch):
+    calls: list[str] = []
+
+    def recording_checkpoint(func, *args, **kwargs):
+        calls.append(func.__name__)
+        kwargs.pop("use_reentrant", None)
+        kwargs.pop("preserve_rng_state", None)
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(torch.utils.checkpoint, "checkpoint", recording_checkpoint)
+    return calls
 
 
 def test_eo1_bfloat16_backbone_and_fp32_flow_head():
@@ -184,6 +241,25 @@ def test_eo1_policy_enables_gradient_checkpointing_from_config(monkeypatch):
     assert backbone.gradient_checkpointing_enable_calls == [{"use_reentrant": False}]
 
 
+def test_eo1_apply_checkpoint_only_runs_when_training_and_grad_enabled(monkeypatch):
+    config = make_test_config(dtype="bfloat16")
+    model = EO1VisionFlowMatchingModel(config, DummyVLMBackbone(config.text_config.hidden_size))
+    calls = patch_checkpoint_to_record(monkeypatch)
+    model.gradient_checkpointing_enable()
+    model.train()
+
+    result = model._apply_checkpoint(lambda x: x + 1, torch.tensor(1.0))
+    assert result.item() == pytest.approx(2.0)
+    assert calls == ["<lambda>"]
+
+    calls.clear()
+    with torch.no_grad():
+        result = model._apply_checkpoint(lambda x: x + 2, torch.tensor(1.0))
+
+    assert result.item() == pytest.approx(3.0)
+    assert calls == []
+
+
 def test_eo1_prepare_helpers_pad_without_mutating_batch_contract():
     policy = SimpleNamespace(config=SimpleNamespace(max_state_dim=6, max_action_dim=8))
     state = torch.ones(2, 4, dtype=torch.float32)
@@ -211,6 +287,22 @@ def test_eo1_embed_suffix_stays_fp32_inside_global_autocast():
     assert action_time_embs.dtype == torch.float32
 
 
+def test_eo1_embed_suffix_uses_manual_checkpointing(monkeypatch):
+    config = make_test_config(dtype="bfloat16")
+    model = EO1VisionFlowMatchingModel(config, DummyVLMBackbone(config.text_config.hidden_size))
+    calls = patch_checkpoint_to_record(monkeypatch)
+    model.gradient_checkpointing_enable()
+    model.train()
+
+    timestep = torch.tensor([0.5], dtype=torch.float32)
+    noisy_actions = torch.randn(1, config.chunk_size, config.max_action_dim, dtype=torch.float32)
+
+    action_time_embs = model.embed_suffix(timestep, noisy_actions)
+
+    assert action_time_embs.dtype == torch.float32
+    assert calls == ["action_proj_func", "mlp_func"]
+
+
 def test_eo1_forward_loss_stays_fp32_inside_global_autocast():
     config = make_test_config(dtype="bfloat16")
     model = EO1VisionFlowMatchingModel(config, DummyVLMBackbone(config.text_config.hidden_size))
@@ -230,6 +322,70 @@ def test_eo1_forward_loss_stays_fp32_inside_global_autocast():
 
     assert outputs.fm_loss is not None
     assert outputs.fm_loss.dtype == torch.float32
+
+
+def test_eo1_forward_uses_manual_checkpointing(monkeypatch):
+    config = make_test_config(dtype="bfloat16")
+    model = EO1VisionFlowMatchingModel(config, DummyVLMBackbone(config.text_config.hidden_size))
+    calls = patch_checkpoint_to_record(monkeypatch)
+    model.gradient_checkpointing_enable()
+    model.train()
+
+    batch_size = 1
+    state_token_id = 9
+    action_token_id = 7
+    input_ids = torch.cat(
+        [
+            torch.full((batch_size, 1), state_token_id, dtype=torch.long),
+            torch.full((batch_size, config.chunk_size), action_token_id, dtype=torch.long),
+        ],
+        dim=1,
+    )
+    attention_mask = torch.ones_like(input_ids)
+    states = torch.randn(batch_size, config.max_state_dim, dtype=torch.float32)
+    action = torch.randn(batch_size, config.chunk_size, config.max_action_dim, dtype=torch.float32)
+
+    outputs = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        states=states,
+        action=action,
+        state_token_id=state_token_id,
+        action_token_id=action_token_id,
+    )
+
+    assert outputs.fm_loss is not None
+    assert calls == [
+        "input_embed_func",
+        "state_proj_func",
+        "action_proj_func",
+        "mlp_func",
+        "vlm_forward_func",
+        "action_out_proj_func",
+    ]
+
+
+def test_eo1_embed_prefix_visual_branch_uses_manual_checkpointing(monkeypatch):
+    config = make_test_config(dtype="bfloat16")
+    backbone = DummyVLMBackbone(config.text_config.hidden_size)
+    model = EO1VisionFlowMatchingModel(config, backbone)
+    calls = patch_checkpoint_to_record(monkeypatch)
+    model.gradient_checkpointing_enable()
+    model.train()
+
+    input_ids = torch.tensor([[11, 12, 13]], dtype=torch.long)
+    pixel_values = torch.randn(1, 3, 2, 2, dtype=torch.float32)
+    image_grid_thw = torch.tensor([[1, 1, 1]], dtype=torch.long)
+
+    inputs_embeds = model.embed_prefix(
+        input_ids=input_ids,
+        pixel_values=pixel_values,
+        image_grid_thw=image_grid_thw,
+    )
+
+    assert inputs_embeds.shape == (1, input_ids.shape[1], config.text_config.hidden_size)
+    assert backbone.image_feature_calls
+    assert calls == ["input_embed_func", "image_embed_func"]
 
 
 def test_eo1_padded_actions_skip_diffusion_noise():

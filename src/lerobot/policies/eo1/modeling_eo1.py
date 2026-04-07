@@ -25,6 +25,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F  # noqa: N812
+import torch.utils.checkpoint
 from torch import Tensor
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import ModelOutput
@@ -240,6 +241,14 @@ class EO1VisionFlowMatchingModel(nn.Module):
         self.vlm_backbone.gradient_checkpointing_disable()
         logger.info("Disabled gradient checkpointing for EO1VisionFlowMatchingModel")
 
+    def _apply_checkpoint(self, func, *args, **kwargs):
+        """Apply manual gradient checkpointing to EO1 flow-head computations when training."""
+        if self.gradient_checkpointing_enabled and self.training and torch.is_grad_enabled():
+            return torch.utils.checkpoint.checkpoint(
+                func, *args, use_reentrant=False, preserve_rng_state=False, **kwargs
+            )
+        return func(*args, **kwargs)
+
     def sample_noise(self, shape, device):
         noise = torch.normal(
             mean=0.0,
@@ -325,36 +334,42 @@ class EO1VisionFlowMatchingModel(nn.Module):
         input_ids: torch.LongTensor,
         inputs_embeds: torch.FloatTensor | None = None,
         pixel_values: torch.Tensor | None = None,
-        pixel_values_videos: torch.FloatTensor | None = None,
         image_grid_thw: torch.LongTensor | None = None,
-        video_grid_thw: torch.LongTensor | None = None,
         states: torch.Tensor | None = None,
         state_token_id: int | None = None,
     ) -> torch.FloatTensor:
         """Embed the suffix"""
         if inputs_embeds is None:
-            inputs_embeds = self.get_input_embeddings()(input_ids)
+
+            def input_embed_func(input_ids: torch.LongTensor) -> torch.FloatTensor:
+                return self.get_input_embeddings()(input_ids)
+
+            inputs_embeds = self._apply_checkpoint(input_embed_func, input_ids)
 
         if pixel_values is not None:
-            image_embeds = self.vlm_backbone.get_image_features(pixel_values, image_grid_thw)
-            image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+
+            def image_embed_func(
+                pixel_values: torch.Tensor,
+                image_grid_thw: torch.LongTensor | None,
+            ) -> torch.FloatTensor:
+                image_embeds = self.vlm_backbone.get_image_features(pixel_values, image_grid_thw)
+                return torch.cat(image_embeds, dim=0)
+
+            image_embeds = self._apply_checkpoint(image_embed_func, pixel_values, image_grid_thw)
+            image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             image_mask, _ = self.vlm_backbone.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
             )
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
-        if pixel_values_videos is not None:
-            video_embeds = self.vlm_backbone.get_video_features(pixel_values_videos, video_grid_thw)
-            video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-            _, video_mask = self.vlm_backbone.get_placeholder_mask(
-                input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
-            )
-            inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
-
         if states is not None:
-            with self.flow_head_autocast_context():
-                states = states.to(dtype=torch.float32)
-                state_embs = self.state_proj(states)
+
+            def state_proj_func(states: torch.Tensor) -> torch.FloatTensor:
+                with self.flow_head_autocast_context():
+                    states = states.to(dtype=torch.float32)
+                    return self.state_proj(states)
+
+            state_embs = self._apply_checkpoint(state_proj_func, states)
             inputs_embeds, _ = self.replace_special_embeddings(
                 input_ids, inputs_embeds, state_embs, state_token_id
             )
@@ -366,21 +381,29 @@ class EO1VisionFlowMatchingModel(nn.Module):
         noisy_actions: torch.Tensor,
     ) -> torch.FloatTensor:
         """Embed the suffix"""
-        with self.flow_head_autocast_context():
-            noisy_actions = noisy_actions.to(dtype=self.action_in_proj.weight.dtype)
-            time_embs = create_sinusoidal_pos_embedding(
-                timestep,
-                self.config.text_config.hidden_size,
-                device=noisy_actions.device,
-            )
-            time_embs = time_embs.to(dtype=noisy_actions.dtype)
-            action_embs = self.action_in_proj(noisy_actions)
-            time_embs = time_embs[:, None, :].expand_as(action_embs)
 
-            action_time_embs = torch.cat([action_embs, time_embs], dim=2)
-            action_time_embs = self.action_time_mlp_in(action_time_embs)
-            action_time_embs = F.silu(action_time_embs)
-            action_time_embs = self.action_time_mlp_out(action_time_embs)
+        def action_proj_func(noisy_actions: torch.Tensor) -> torch.FloatTensor:
+            with self.flow_head_autocast_context():
+                noisy_actions = noisy_actions.to(dtype=self.action_in_proj.weight.dtype)
+                return self.action_in_proj(noisy_actions)
+
+        action_embs = self._apply_checkpoint(action_proj_func, noisy_actions)
+        time_embs = create_sinusoidal_pos_embedding(
+            timestep,
+            self.config.text_config.hidden_size,
+            device=action_embs.device,
+        )
+        time_embs = time_embs.to(dtype=action_embs.dtype)
+        time_embs = time_embs[:, None, :].expand_as(action_embs)
+        action_time_embs = torch.cat([action_embs, time_embs], dim=2)
+
+        def mlp_func(action_time_embs: torch.Tensor) -> torch.FloatTensor:
+            with self.flow_head_autocast_context():
+                action_time_embs = self.action_time_mlp_in(action_time_embs)
+                action_time_embs = F.silu(action_time_embs)
+                return self.action_time_mlp_out(action_time_embs)
+
+        action_time_embs = self._apply_checkpoint(mlp_func, action_time_embs)
         return action_time_embs
 
     def forward(
@@ -429,26 +452,39 @@ class EO1VisionFlowMatchingModel(nn.Module):
             image_grid_thw=image_grid_thw,
             attention_mask=attention_mask,
         )
-        outputs = self.vlm_backbone.model(
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            inputs_embeds=inputs_embeds,
-            use_cache=False,
-            output_hidden_states=False,
-            return_dict=True,
-        )
 
-        hidden_states = outputs.last_hidden_state
+        def vlm_forward_func(
+            position_ids: torch.LongTensor,
+            attention_mask: torch.Tensor | None,
+            inputs_embeds: torch.FloatTensor,
+        ) -> torch.FloatTensor:
+            outputs = self.vlm_backbone.model(
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                inputs_embeds=inputs_embeds,
+                use_cache=False,
+                output_hidden_states=False,
+                return_dict=True,
+            )
+            return outputs.last_hidden_state
+
+        hidden_states = self._apply_checkpoint(vlm_forward_func, position_ids, attention_mask, inputs_embeds)
 
         fm_loss = None
         v_t = None
         if action is not None:
-            with self.flow_head_autocast_context():
-                action_time_embs = hidden_states[action_mask[..., 0]].to(dtype=self.action_out_proj.dtype)
-                v_t = self.action_out_proj(action_time_embs)
-                u_t = u_t.reshape(v_t.shape)
-                v_t = v_t.to(dtype=u_t.dtype)
+            action_hidden_states = hidden_states[action_mask[..., 0]]
 
+            def action_out_proj_func(action_hidden_states: torch.FloatTensor) -> torch.FloatTensor:
+                with self.flow_head_autocast_context():
+                    action_hidden_states = action_hidden_states.to(dtype=self.action_out_proj.dtype)
+                    return self.action_out_proj(action_hidden_states)
+
+            v_t = self._apply_checkpoint(action_out_proj_func, action_hidden_states)
+            u_t = u_t.reshape(v_t.shape)
+            v_t = v_t.to(dtype=u_t.dtype)
+
+            with self.flow_head_autocast_context():
                 losses = F.mse_loss(u_t, v_t, reduction="none")
             fm_loss = self.reduce_flow_matching_loss(losses, action_is_pad)
 

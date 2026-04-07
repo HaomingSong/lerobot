@@ -64,6 +64,9 @@ class EO1Config(PreTrainedConfig):
     # Model dtype.
     dtype: str = "bfloat16"  # Options: "auto", "bfloat16", "float32"
 
+    # Training settings.
+    gradient_checkpointing: bool = False  # Enable gradient checkpointing for memory optimization
+
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
             "VISUAL": NormalizationMode.IDENTITY,

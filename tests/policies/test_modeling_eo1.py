@@ -23,6 +23,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.policies.eo1.configuration_eo1 import EO1Config
 from lerobot.policies.eo1.modeling_eo1 import EO1Policy, EO1VisionFlowMatchingModel
 
@@ -37,9 +38,20 @@ class DummyVLMBackbone(nn.Module):
         self.rope_deltas = None
         self.forward_calls: list[dict[str, object]] = []
         self.model_calls: list[dict[str, object]] = []
+        self.gradient_checkpointing = False
+        self.gradient_checkpointing_enable_calls: list[dict[str, object] | None] = []
+        self.gradient_checkpointing_disable_calls = 0
 
     def get_input_embeddings(self):
         return self.embedding
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs: dict[str, object] | None = None):
+        self.gradient_checkpointing = True
+        self.gradient_checkpointing_enable_calls.append(gradient_checkpointing_kwargs)
+
+    def gradient_checkpointing_disable(self):
+        self.gradient_checkpointing = False
+        self.gradient_checkpointing_disable_calls += 1
 
     def get_rope_index(
         self,
@@ -127,6 +139,49 @@ def test_eo1_state_proj_uses_max_state_dim():
 
     assert model.state_proj.in_features == config.max_state_dim
     assert model.action_in_proj.in_features == config.max_action_dim
+
+
+def test_eo1_gradient_checkpointing_enable_propagates_to_backbone():
+    config = make_test_config(dtype="bfloat16")
+    backbone = DummyVLMBackbone(config.text_config.hidden_size)
+    model = EO1VisionFlowMatchingModel(config, backbone)
+
+    model.gradient_checkpointing_enable()
+
+    assert model.gradient_checkpointing_enabled is True
+    assert backbone.gradient_checkpointing is True
+    assert backbone.gradient_checkpointing_enable_calls == [{"use_reentrant": False}]
+
+
+def test_eo1_gradient_checkpointing_disable_propagates_to_backbone():
+    config = make_test_config(dtype="bfloat16")
+    backbone = DummyVLMBackbone(config.text_config.hidden_size)
+    model = EO1VisionFlowMatchingModel(config, backbone)
+
+    model.gradient_checkpointing_enable()
+    model.gradient_checkpointing_disable()
+
+    assert model.gradient_checkpointing_enabled is False
+    assert backbone.gradient_checkpointing is False
+    assert backbone.gradient_checkpointing_disable_calls == 1
+
+
+def test_eo1_policy_enables_gradient_checkpointing_from_config(monkeypatch):
+    config = make_test_config(dtype="bfloat16", gradient_checkpointing=True)
+    config.input_features["observation.image"] = PolicyFeature(type=FeatureType.VISUAL, shape=(3, 224, 224))
+
+    backbone = DummyVLMBackbone(config.text_config.hidden_size)
+
+    monkeypatch.setattr(
+        "lerobot.policies.eo1.modeling_eo1.Qwen2_5_VLForConditionalGeneration.from_pretrained",
+        lambda *args, **kwargs: backbone,
+    )
+
+    policy = EO1Policy(config)
+
+    assert policy.model.gradient_checkpointing_enabled is True
+    assert backbone.gradient_checkpointing is True
+    assert backbone.gradient_checkpointing_enable_calls == [{"use_reentrant": False}]
 
 
 def test_eo1_prepare_helpers_pad_without_mutating_batch_contract():

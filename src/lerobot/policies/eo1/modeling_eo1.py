@@ -80,6 +80,8 @@ class EO1Policy(PreTrainedPolicy):
             vlm_backbone = Qwen2_5_VLForConditionalGeneration(vlm_config)
 
         self.model = EO1VisionFlowMatchingModel(config, vlm_backbone)
+        if config.gradient_checkpointing:
+            self.model.gradient_checkpointing_enable()
 
         self.model.to(config.device)
         self.reset()
@@ -216,12 +218,27 @@ class EO1VisionFlowMatchingModel(nn.Module):
         )
         self.action_time_mlp_in = nn.Linear(hidden_size * 2, hidden_size, dtype=torch.float32)
         self.action_time_mlp_out = nn.Linear(hidden_size, hidden_size, dtype=torch.float32)
+        self.gradient_checkpointing_enabled = False
 
     def get_input_embeddings(self):
         return self.vlm_backbone.get_input_embeddings()
 
     def flow_head_autocast_context(self):
         return torch.autocast(device_type=self.state_proj.weight.device.type, enabled=False)
+
+    def gradient_checkpointing_enable(self):
+        """Enable gradient checkpointing for the Qwen2.5-VL backbone."""
+        self.gradient_checkpointing_enabled = True
+        self.vlm_backbone.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        logger.info("Enabled gradient checkpointing for EO1VisionFlowMatchingModel")
+
+    def gradient_checkpointing_disable(self):
+        """Disable gradient checkpointing for the Qwen2.5-VL backbone."""
+        self.gradient_checkpointing_enabled = False
+        self.vlm_backbone.gradient_checkpointing_disable()
+        logger.info("Disabled gradient checkpointing for EO1VisionFlowMatchingModel")
 
     def sample_noise(self, shape, device):
         noise = torch.normal(

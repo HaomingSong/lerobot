@@ -39,7 +39,7 @@ class EO1Config(PreTrainedConfig):
     # If pretrained path not set, init from VLM huggingface repo.
     # vlm_base: str = "Qwen/Qwen2.5-VL-3B-Instruct"
     vlm_base: str = "/mnt/inspurfs/evla2_t/eo-robotics/eo1_artifacts/Qwen2.5-VL-3B-Instruct"
-    vlm_config: dict = field(default_factory=lambda: Qwen2_5_VLConfig().to_dict())
+    vlm_config: dict | None = None
 
     # Vision processor settings.
     image_min_pixels: int | None = 64 * 28 * 28
@@ -63,6 +63,10 @@ class EO1Config(PreTrainedConfig):
 
     # Model dtype.
     dtype: str = "bfloat16"  # Options: "auto", "bfloat16", "float32"
+
+    # Optional attention backend request passed through to the Qwen backbone.
+    # Common values: None, "eager", "sdpa", "flash_attention_2".
+    attn_implementation: str | None = None
 
     # Training settings.
     gradient_checkpointing: bool = False  # Enable gradient checkpointing for memory optimization
@@ -98,20 +102,24 @@ class EO1Config(PreTrainedConfig):
                 f"n_action_steps ({self.n_action_steps}) cannot be greater than chunk_size ({self.chunk_size})"
             )
 
-        # HACK: 需要正确配置vlm_config, 如果是from_pretrained, 则vlm_config来自json的反序列化，如果是直接初始化的，则需要从已有的vlm_base的checkpoint中加载配置
-        if self.pretrained_path is None:
+        # Populate the serialized backbone config only when the caller did not provide one.
+        if self.vlm_config is None:
             self.vlm_config = Qwen2_5_VLConfig.from_pretrained(self.vlm_base).to_dict()
 
-    def get_vlm_config(self) -> Qwen2_5_VLConfig:
-        return Qwen2_5_VLConfig(**deepcopy(self.vlm_config))
+    @property
+    def vlm_backbone_config(self) -> Qwen2_5_VLConfig:
+        config_dict = deepcopy(self.vlm_config)
+        if self.attn_implementation is not None:
+            config_dict["attn_implementation"] = self.attn_implementation
+        return Qwen2_5_VLConfig(**config_dict)
 
     @property
     def text_config(self) -> Qwen2_5_VLTextConfig:
-        return Qwen2_5_VLTextConfig(**deepcopy(self.vlm_config["text_config"]))
+        return self.vlm_backbone_config.text_config
 
     @property
     def vision_config(self) -> Qwen2_5_VLVisionConfig:
-        return Qwen2_5_VLVisionConfig(**deepcopy(self.vlm_config["vision_config"]))
+        return self.vlm_backbone_config.vision_config
 
     def validate_features(self) -> None:
         """Validate and set up input/output features for Groot."""

@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -24,6 +25,7 @@ import torch
 import torch.nn as nn
 import torch.utils.checkpoint
 
+from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.policies.eo1.configuration_eo1 import EO1Config
 from lerobot.policies.eo1.modeling_eo1 import EO1Policy, EO1VisionFlowMatchingModel
@@ -33,9 +35,13 @@ DEFAULT_QWEN_ROOT = WORKSPACE_ROOT / "eo1_artifacts" / "Qwen2.5-VL-3B-Instruct"
 
 
 class DummyVLMBackbone(nn.Module):
-    def __init__(self, hidden_size: int):
+    def __init__(self, hidden_size: int, resolved_attn_implementation: str | None = None):
         super().__init__()
         self.embedding = nn.Embedding(512, hidden_size)
+        self.config = SimpleNamespace(
+            _attn_implementation=resolved_attn_implementation,
+            text_config=SimpleNamespace(hidden_size=hidden_size),
+        )
         self.rope_deltas = None
         self.forward_calls: list[dict[str, object]] = []
         self.model_calls: list[dict[str, object]] = []
@@ -178,10 +184,58 @@ def patch_checkpoint_to_record(monkeypatch):
     return calls
 
 
+def test_eo1_config_applies_requested_attn_implementation_without_mutating_vlm_config():
+    config = make_test_config(attn_implementation="flash_attention_2")
+    original_vlm_config = deepcopy(config.vlm_config)
+
+    vlm_config = config.vlm_backbone_config
+
+    assert isinstance(config.vlm_config, dict)
+    assert vlm_config._attn_implementation == "flash_attention_2"
+    assert vlm_config.text_config._attn_implementation == "flash_attention_2"
+    assert vlm_config.vision_config._attn_implementation == "flash_attention_2"
+    assert config.vlm_backbone_config._attn_implementation == "flash_attention_2"
+    assert config.text_config._attn_implementation == "flash_attention_2"
+    assert config.vision_config._attn_implementation == "flash_attention_2"
+    assert config.vlm_config == original_vlm_config
+
+
+def test_eo1_config_keeps_provided_vlm_config_without_reloading(monkeypatch):
+    seed_config = make_test_config()
+    custom_vlm_config = deepcopy(seed_config.vlm_config)
+    custom_vlm_config["text_config"]["hidden_size"] = 1234
+
+    def fail_from_pretrained(*args, **kwargs):
+        raise AssertionError("from_pretrained should not be called when vlm_config is provided")
+
+    monkeypatch.setattr(
+        "lerobot.policies.eo1.configuration_eo1.Qwen2_5_VLConfig.from_pretrained",
+        fail_from_pretrained,
+    )
+
+    config = EO1Config(vlm_base="unused", vlm_config=custom_vlm_config)
+
+    assert config.vlm_config == custom_vlm_config
+    assert config.vlm_backbone_config.text_config.hidden_size == 1234
+
+
+def test_eo1_config_roundtrip_persists_requested_attn_implementation(tmp_path):
+    config = make_test_config(attn_implementation="flash_attention_2")
+
+    config._save_pretrained(tmp_path)
+    reloaded = PreTrainedConfig.from_pretrained(tmp_path)
+
+    assert isinstance(reloaded, EO1Config)
+    assert reloaded.attn_implementation == "flash_attention_2"
+    assert isinstance(reloaded.vlm_config, dict)
+    assert reloaded.vlm_backbone_config._attn_implementation == "flash_attention_2"
+
+
 def test_eo1_bfloat16_backbone_and_fp32_flow_head():
     config = make_test_config(dtype="bfloat16")
     model = EO1VisionFlowMatchingModel(config, DummyVLMBackbone(config.text_config.hidden_size))
 
+    assert model.hidden_size == config.text_config.hidden_size
     assert model.vlm_backbone.embedding.weight.dtype == torch.bfloat16
     assert model.state_proj.weight.dtype == torch.float32
     assert model.action_in_proj.weight.dtype == torch.float32
@@ -239,6 +293,65 @@ def test_eo1_policy_enables_gradient_checkpointing_from_config(monkeypatch):
     assert policy.model.gradient_checkpointing_enabled is True
     assert backbone.gradient_checkpointing is True
     assert backbone.gradient_checkpointing_enable_calls == [{"use_reentrant": False}]
+
+
+def test_eo1_policy_forwards_attn_implementation_to_vlm_from_pretrained(monkeypatch):
+    config = make_test_config(dtype="bfloat16", attn_implementation="flash_attention_2")
+    config.input_features["observation.image"] = PolicyFeature(type=FeatureType.VISUAL, shape=(3, 224, 224))
+
+    captured: dict[str, object] = {}
+
+    def fake_from_pretrained(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return DummyVLMBackbone(
+            config.text_config.hidden_size,
+            resolved_attn_implementation=kwargs.get("attn_implementation"),
+        )
+
+    monkeypatch.setattr(
+        "lerobot.policies.eo1.modeling_eo1.Qwen2_5_VLForConditionalGeneration.from_pretrained",
+        fake_from_pretrained,
+    )
+
+    EO1Policy(config)
+
+    assert captured["args"] == (config.vlm_base,)
+    assert captured["kwargs"] == {
+        "dtype": config.dtype,
+        "attn_implementation": "flash_attention_2",
+    }
+
+
+def test_eo1_policy_applies_attn_implementation_to_constructed_vlm_config(monkeypatch):
+    config = make_test_config(
+        dtype="bfloat16",
+        pretrained_path=Path("/tmp/fake-pretrained-policy"),
+        attn_implementation="sdpa",
+    )
+    config.input_features["observation.image"] = PolicyFeature(type=FeatureType.VISUAL, shape=(3, 224, 224))
+
+    captured: dict[str, object] = {}
+
+    class DummyConstructedQwenBackbone:
+        def __new__(cls, vlm_config):
+            captured["vlm_config"] = vlm_config
+            return DummyVLMBackbone(
+                vlm_config.text_config.hidden_size,
+                resolved_attn_implementation=vlm_config._attn_implementation,
+            )
+
+    monkeypatch.setattr(
+        "lerobot.policies.eo1.modeling_eo1.Qwen2_5_VLForConditionalGeneration",
+        DummyConstructedQwenBackbone,
+    )
+
+    EO1Policy(config)
+
+    vlm_config = captured["vlm_config"]
+    assert vlm_config._attn_implementation == "sdpa"
+    assert vlm_config.text_config._attn_implementation == "sdpa"
+    assert vlm_config.vision_config._attn_implementation == "sdpa"
 
 
 def test_eo1_apply_checkpoint_only_runs_when_training_and_grad_enabled(monkeypatch):

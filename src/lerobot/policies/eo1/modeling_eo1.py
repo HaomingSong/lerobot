@@ -74,11 +74,12 @@ class EO1Policy(PreTrainedPolicy):
         if config.pretrained_path is None:
             # Initialize from pretrained VLM
             vlm_backbone = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                config.vlm_base, dtype=config.dtype
+                config.vlm_base,
+                dtype=config.dtype,
+                attn_implementation=config.attn_implementation,
             )
         else:
-            vlm_config = config.get_vlm_config()
-            vlm_backbone = Qwen2_5_VLForConditionalGeneration(vlm_config)
+            vlm_backbone = Qwen2_5_VLForConditionalGeneration(config.vlm_backbone_config)
 
         self.model = EO1VisionFlowMatchingModel(config, vlm_backbone)
         if config.gradient_checkpointing:
@@ -204,21 +205,21 @@ class EO1VisionFlowMatchingModel(nn.Module):
         super().__init__()
 
         self.config = config
-        hidden_size = config.text_config.hidden_size
+        self.vlm_backbone = vlm_backbone.to(dtype=getattr(torch, config.dtype))
+        self.hidden_size = self.vlm_backbone.config.text_config.hidden_size
         max_state_dim = config.max_state_dim
         max_action_dim = config.max_action_dim
-        self.vlm_backbone = vlm_backbone.to(dtype=getattr(torch, config.dtype))
-        self.state_proj = nn.Linear(max_state_dim, hidden_size, dtype=torch.float32)
-        self.action_in_proj = nn.Linear(max_action_dim, hidden_size, dtype=torch.float32)
+        self.state_proj = nn.Linear(max_state_dim, self.hidden_size, dtype=torch.float32)
+        self.action_in_proj = nn.Linear(max_action_dim, self.hidden_size, dtype=torch.float32)
         self.action_out_proj = EO1VisionActionProjector(
-            hidden_size,
+            self.hidden_size,
             max_action_dim,
             config.num_action_layers,
             config.action_act,
             dtype=torch.float32,
         )
-        self.action_time_mlp_in = nn.Linear(hidden_size * 2, hidden_size, dtype=torch.float32)
-        self.action_time_mlp_out = nn.Linear(hidden_size, hidden_size, dtype=torch.float32)
+        self.action_time_mlp_in = nn.Linear(self.hidden_size * 2, self.hidden_size, dtype=torch.float32)
+        self.action_time_mlp_out = nn.Linear(self.hidden_size, self.hidden_size, dtype=torch.float32)
         self.gradient_checkpointing_enabled = False
 
     def get_input_embeddings(self):
@@ -390,7 +391,7 @@ class EO1VisionFlowMatchingModel(nn.Module):
         action_embs = self._apply_checkpoint(action_proj_func, noisy_actions)
         time_embs = create_sinusoidal_pos_embedding(
             timestep,
-            self.config.text_config.hidden_size,
+            self.hidden_size,
             device=action_embs.device,
         )
         time_embs = time_embs.to(dtype=action_embs.dtype)

@@ -484,8 +484,7 @@ class EO1VisionFlowMatchingModel(nn.Module):
             u_t = u_t.reshape(v_t.shape)
             v_t = v_t.to(dtype=u_t.dtype)
 
-            with self.flow_head_autocast_context():
-                losses = F.mse_loss(u_t, v_t, reduction="none")
+            losses = F.mse_loss(u_t, v_t, reduction="none")
             fm_loss = self.reduce_flow_matching_loss(losses, action_is_pad)
 
         return EO1VisionFlowMatchingOutputWithPast(

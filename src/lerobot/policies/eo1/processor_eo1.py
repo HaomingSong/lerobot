@@ -18,9 +18,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import torch
-import torchvision.transforms.functional as F  # noqa: N812
-from qwen_vl_utils.vision_process import IMAGE_FACTOR, process_vision_info, smart_resize
-from torchvision.transforms import InterpolationMode
 
 from lerobot.configs.types import FeatureType, PipelineFeatureType, PolicyFeature
 from lerobot.policies.eo1.configuration_eo1 import EO1Config
@@ -56,41 +53,18 @@ STATE_START_TOKEN = "<|state_start|>"
 DEFAULT_STATE_TOKEN = "<|state_pad|>"
 STATE_END_TOKEN = "<|state_end|>"
 TASK_VLA_TOKEN = "<|vla|>"
-
-
-def get_image_info(image_path, min_pixel, max_pixel, width, height):
-    content = {
-        "type": "image",
-        "image": image_path,
-        "min_pixels": min_pixel,
-        "max_pixels": max_pixel,
-    }
-
-    if width is not None and height is not None:
-        content["resized_width"] = width
-        content["resized_height"] = height
-
-    messages = [{"role": "user", "content": [content]}]
-
-    image_input, _ = process_vision_info(messages)
-    return image_input[0]
+FLOAT_IMAGE_TOLERANCE = 1e-3
 
 
 @dataclass
-@ProcessorStepRegistry.register(name="eo1_image_smart_resize_processor")
-class EO1ImageSmartResizeStep(ObservationProcessorStep):
+@ProcessorStepRegistry.register(name="eo1_restore_raw_uint8_processor")
+class EO1RestoreRawUint8Step(ObservationProcessorStep):
     input_features: dict[str, PolicyFeature] | dict[str, dict[str, Any]]
+    float_tolerance: float = FLOAT_IMAGE_TOLERANCE
 
-    image_min_pixels: int | None = 64 * 28 * 28
-    image_max_pixels: int | None = 128 * 28 * 28
-    image_resized_width: int | None = None
-    image_resized_height: int | None = None
-    size_factor: int = IMAGE_FACTOR
-
-    _resized_features: dict[str, PolicyFeature] = field(default_factory=dict, init=False, repr=False)
+    _image_keys: list[str] = field(default_factory=list, init=False, repr=False)
 
     def __post_init__(self):
-        # Robust JSON deserialization handling (guard empty maps).
         if self.input_features:
             first_val = next(iter(self.input_features.values()))
             if isinstance(first_val, dict):
@@ -100,78 +74,58 @@ class EO1ImageSmartResizeStep(ObservationProcessorStep):
                         type=FeatureType(ft_dict["type"]), shape=tuple(ft_dict["shape"])
                     )
                 self.input_features = reconstructed
-
-        for key, value in self.input_features.items():
-            if value.type != FeatureType.VISUAL:
-                continue
-
-            channels, height, width = value.shape
-            if self.image_resized_width is not None and self.image_resized_height is not None:
-                resized_height, resized_width = smart_resize(
-                    self.image_resized_height,
-                    self.image_resized_width,
-                    factor=self.size_factor,
-                )
-            else:
-                resized_height, resized_width = smart_resize(
-                    height,
-                    width,
-                    factor=self.size_factor,
-                    min_pixels=self.image_min_pixels,
-                    max_pixels=self.image_max_pixels,
-                )
-            self._resized_features[key] = PolicyFeature(
-                type=FeatureType.VISUAL, shape=(channels, resized_height, resized_width)
-            )
+        self._image_keys = [
+            key for key, value in self.input_features.items() if value.type == FeatureType.VISUAL
+        ]
 
     def get_config(self) -> dict[str, Any]:
         return {
             "input_features": {
                 key: {"type": ft.type.value, "shape": ft.shape} for key, ft in self.input_features.items()
             },
-            "image_min_pixels": self.image_min_pixels,
-            "image_max_pixels": self.image_max_pixels,
-            "image_resized_width": self.image_resized_width,
-            "image_resized_height": self.image_resized_height,
-            "size_factor": self.size_factor,
+            "float_tolerance": self.float_tolerance,
         }
 
-    def resize_image(self, image, resized_height, resized_width):
-        return F.resize(
-            image,
-            (resized_height, resized_width),
-            interpolation=InterpolationMode.BICUBIC,
-            antialias=True,
-        )
+    def _restore_visual_tensor(self, image: torch.Tensor, key: str) -> torch.Tensor:
+        image = torch.as_tensor(image)
+
+        if image.ndim not in (3, 4):
+            raise ValueError(
+                f"Visual observation '{key}' must be rank-3 or rank-4, got shape {tuple(image.shape)}."
+            )
+
+        if image.dtype == torch.uint8:
+            return image
+
+        if not torch.is_floating_point(image):
+            raise ValueError(
+                f"Visual observation '{key}' must be uint8 or floating point, got {image.dtype}."
+            )
+
+        if not torch.isfinite(image).all():
+            raise ValueError(f"Visual observation '{key}' contains non-finite values and cannot be restored.")
+
+        min_val = image.amin().item()
+        max_val = image.amax().item()
+        if min_val < -self.float_tolerance or max_val > 1.0 + self.float_tolerance:
+            raise ValueError(
+                f"Visual observation '{key}' must stay within [0, 1] before restoration, "
+                f"got range [{min_val}, {max_val}]."
+            )
+
+        return image.clamp(0.0, 1.0).mul(255.0).round().to(torch.uint8)
 
     def observation(self, observation):
-        return self._process_observation(observation)
-
-    def _process_observation(self, observation):
-        """Resize the image to the resized_features."""
         processed_obs = observation.copy()
-
-        for key, value in self._resized_features.items():
+        for key in self._image_keys:
             if key not in processed_obs:
                 raise ValueError(f"Missing visual observation '{key}' required by {self.__class__.__name__}.")
-            _, resized_height, resized_width = value.shape
-            image = processed_obs.pop(key)
-            image = self.resize_image(image, resized_height, resized_width)
-            processed_obs[key] = image
+            processed_obs[key] = self._restore_visual_tensor(processed_obs[key], key)
         return processed_obs
 
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
     ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
-        """Resize the image to the resized_features.
-        Args:
-            features: The input feature dictionary.
-
-        Returns:
-            The feature dictionary with the image resized to the resized_features.
-        """
-        for key, value in self._resized_features.items():
-            features[PipelineFeatureType.OBSERVATION][key] = value
         return features
 
 
@@ -266,6 +220,8 @@ class EO1ConversationTemplateStep(ComplementaryDataProcessorStep):
 class EO1QwenProcessorStep(ComplementaryDataProcessorStep):
     # processor_name: str = "/mnt/inspurfs/evla2_t/eo-robotics/eo1_artifacts/Qwen2.5-VL-3B-Instruct"
     processor_name: str = "Qwen/Qwen2.5-VL-3B-Instruct"
+    image_min_pixels: int | None = 64 * 28 * 28
+    image_max_pixels: int | None = 128 * 28 * 28
 
     _processor: Qwen2_5_VLProcessor | None = field(default=None, init=False, repr=False)
     _state_token_id: int | None = field(default=None, init=False, repr=False)
@@ -300,7 +256,8 @@ class EO1QwenProcessorStep(ComplementaryDataProcessorStep):
             tokenize=True,
             padding=True,
             padding_side=padding_side,
-            do_resize=False,
+            min_pixels=self.image_min_pixels,
+            max_pixels=self.image_max_pixels,
             add_generation_prompt=False,
             return_dict=True,
             return_tensors="pt",
@@ -319,6 +276,8 @@ class EO1QwenProcessorStep(ComplementaryDataProcessorStep):
     def get_config(self) -> dict[str, Any]:
         return {
             "processor_name": self.processor_name,
+            "image_min_pixels": self.image_min_pixels,
+            "image_max_pixels": self.image_max_pixels,
         }
 
     def transform_features(
@@ -347,16 +306,15 @@ def make_eo1_pre_post_processors(
             norm_map=config.normalization_mapping,
             stats=dataset_stats,
         ),
-        EO1ImageSmartResizeStep(
+        EO1RestoreRawUint8Step(
             input_features=config.input_features,
-            image_min_pixels=config.image_min_pixels,
-            image_max_pixels=config.image_max_pixels,
-            image_resized_width=config.image_resized_width,
-            image_resized_height=config.image_resized_height,
-            size_factor=IMAGE_FACTOR,
         ),
         EO1ConversationTemplateStep(input_features=config.input_features, chunk_size=config.chunk_size),
-        EO1QwenProcessorStep(processor_name=config.vlm_base),
+        EO1QwenProcessorStep(
+            processor_name=config.vlm_base,
+            image_min_pixels=config.image_min_pixels,
+            image_max_pixels=config.image_max_pixels,
+        ),
         DeviceProcessorStep(device=config.device),
     ]
 

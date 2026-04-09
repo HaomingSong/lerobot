@@ -573,9 +573,3 @@ class EO1VisionFlowMatchingModel(nn.Module):
             x_t += dt * v_t.reshape(x_t.shape)
 
         return x_t
-
-    def prepare_inputs_for_generation(self, *args, **kwargs):
-        return self.vlm_backbone.prepare_inputs_for_generation(*args, **kwargs)
-
-    def _expand_inputs_for_generation(self, *args, **kwargs):
-        return self.vlm_backbone._expand_inputs_for_generation(*args, **kwargs)

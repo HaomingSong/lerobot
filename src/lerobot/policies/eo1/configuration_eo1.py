@@ -44,8 +44,6 @@ class EO1Config(PreTrainedConfig):
     # Vision processor settings.
     image_min_pixels: int | None = 64 * 28 * 28
     image_max_pixels: int | None = 128 * 28 * 28
-    image_resized_width: int | None = None
-    image_resized_height: int | None = None
 
     # Execution and action horizon.
     n_obs_steps: int = 1

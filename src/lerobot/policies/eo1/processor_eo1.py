@@ -27,7 +27,6 @@ from lerobot.processor import (
     ComplementaryDataProcessorStep,
     DeviceProcessorStep,
     NormalizerProcessorStep,
-    ObservationProcessorStep,
     PolicyAction,
     PolicyProcessorPipeline,
     ProcessorStep,
@@ -53,80 +52,6 @@ STATE_START_TOKEN = "<|state_start|>"
 DEFAULT_STATE_TOKEN = "<|state_pad|>"
 STATE_END_TOKEN = "<|state_end|>"
 TASK_VLA_TOKEN = "<|vla|>"
-FLOAT_IMAGE_TOLERANCE = 1e-3
-
-
-@dataclass
-@ProcessorStepRegistry.register(name="eo1_restore_raw_uint8_processor")
-class EO1RestoreRawUint8Step(ObservationProcessorStep):
-    input_features: dict[str, PolicyFeature] | dict[str, dict[str, Any]]
-    float_tolerance: float = FLOAT_IMAGE_TOLERANCE
-
-    _image_keys: list[str] = field(default_factory=list, init=False, repr=False)
-
-    def __post_init__(self):
-        if self.input_features:
-            first_val = next(iter(self.input_features.values()))
-            if isinstance(first_val, dict):
-                reconstructed = {}
-                for key, ft_dict in self.input_features.items():
-                    reconstructed[key] = PolicyFeature(
-                        type=FeatureType(ft_dict["type"]), shape=tuple(ft_dict["shape"])
-                    )
-                self.input_features = reconstructed
-        self._image_keys = [
-            key for key, value in self.input_features.items() if value.type == FeatureType.VISUAL
-        ]
-
-    def get_config(self) -> dict[str, Any]:
-        return {
-            "input_features": {
-                key: {"type": ft.type.value, "shape": ft.shape} for key, ft in self.input_features.items()
-            },
-            "float_tolerance": self.float_tolerance,
-        }
-
-    def _restore_visual_tensor(self, image: torch.Tensor, key: str) -> torch.Tensor:
-        image = torch.as_tensor(image)
-
-        if image.ndim not in (3, 4):
-            raise ValueError(
-                f"Visual observation '{key}' must be rank-3 or rank-4, got shape {tuple(image.shape)}."
-            )
-
-        if image.dtype == torch.uint8:
-            return image
-
-        if not torch.is_floating_point(image):
-            raise ValueError(
-                f"Visual observation '{key}' must be uint8 or floating point, got {image.dtype}."
-            )
-
-        if not torch.isfinite(image).all():
-            raise ValueError(f"Visual observation '{key}' contains non-finite values and cannot be restored.")
-
-        min_val = image.amin().item()
-        max_val = image.amax().item()
-        if min_val < -self.float_tolerance or max_val > 1.0 + self.float_tolerance:
-            raise ValueError(
-                f"Visual observation '{key}' must stay within [0, 1] before restoration, "
-                f"got range [{min_val}, {max_val}]."
-            )
-
-        return image.clamp(0.0, 1.0).mul(255.0).round().to(torch.uint8)
-
-    def observation(self, observation):
-        processed_obs = observation.copy()
-        for key in self._image_keys:
-            if key not in processed_obs:
-                raise ValueError(f"Missing visual observation '{key}' required by {self.__class__.__name__}.")
-            processed_obs[key] = self._restore_visual_tensor(processed_obs[key], key)
-        return processed_obs
-
-    def transform_features(
-        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
-    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
-        return features
 
 
 @dataclass
@@ -165,10 +90,13 @@ class EO1ConversationTemplateStep(ComplementaryDataProcessorStep):
         if OBS_STATE in observation and observation[OBS_STATE].shape[0] != len(tasks):
             raise ValueError("Batch size mismatch between observation.state and task list.")
 
+        # LeRobot visual observations reach in processor as float32 tensors in [0, 1].
+        # Convert to uint8 in [0, 255] to meet the input requirement of Qwen2.5-VL-3B-Instruct.
+        images = {key: observation[key].mul(255.0).round().to(torch.uint8) for key in self._image_keys}
         messages = []
         for i in range(len(tasks)):
             content = [
-                *[{"type": "image", "image": observation[key][i]} for key in self._image_keys],
+                *[{"type": "image", "image": images[key][i]} for key in self._image_keys],
                 {
                     "type": "text",
                     "text": (
@@ -305,9 +233,6 @@ def make_eo1_pre_post_processors(
             features={**config.input_features, **config.output_features},
             norm_map=config.normalization_mapping,
             stats=dataset_stats,
-        ),
-        EO1RestoreRawUint8Step(
-            input_features=config.input_features,
         ),
         EO1ConversationTemplateStep(input_features=config.input_features, chunk_size=config.chunk_size),
         EO1QwenProcessorStep(

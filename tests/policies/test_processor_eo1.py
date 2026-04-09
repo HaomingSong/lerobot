@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import pytest
 import torch
 
 from lerobot.configs.types import FeatureType, PipelineFeatureType, PolicyFeature
@@ -85,54 +84,26 @@ def build_messages():
     ]
 
 
-def test_eo1_restore_raw_uint8_recovers_exact_bytes_from_float_inputs():
-    step = processor_module.EO1RestoreRawUint8Step(input_features=build_input_features())
+def test_eo1_conversation_template_restores_uint8_images():
+    step = processor_module.EO1ConversationTemplateStep(
+        input_features=build_input_features(),
+        chunk_size=4,
+    )
     raw_image = torch.randint(0, 256, (2, 3, 16, 16), dtype=torch.uint8)
 
     transition = create_transition(
         observation={"observation.image": raw_image.float() / 255.0},
+        complementary_data={"task": ["pick", "place"]},
     )
 
     output = step(transition)
-    restored = output[processor_module.TransitionKey.OBSERVATION]["observation.image"]
+    messages = output[processor_module.TransitionKey.COMPLEMENTARY_DATA]["messages"]
+    restored = messages[0][1]["content"][0]["image"]
 
     assert restored.dtype == torch.uint8
-    assert torch.equal(restored, raw_image)
-
-
-def test_eo1_restore_raw_uint8_passes_through_uint8_inputs():
-    step = processor_module.EO1RestoreRawUint8Step(input_features=build_input_features())
-    raw_image = torch.randint(0, 256, (2, 3, 16, 16), dtype=torch.uint8)
-
-    transition = create_transition(
-        observation={"observation.image": raw_image},
-    )
-
-    output = step(transition)
-    restored = output[processor_module.TransitionKey.OBSERVATION]["observation.image"]
-
-    assert restored.dtype == torch.uint8
-    assert torch.equal(restored, raw_image)
-
-
-@pytest.mark.parametrize(
-    "bad_image",
-    [
-        torch.full((1, 3, 16, 16), 1.2, dtype=torch.float32),
-        torch.full((1, 3, 16, 16), -0.2, dtype=torch.float32),
-        torch.full((1, 3, 16, 16), float("nan"), dtype=torch.float32),
-        torch.ones((1, 3, 16, 16), dtype=torch.int16),
-    ],
-)
-def test_eo1_restore_raw_uint8_rejects_invalid_inputs(bad_image):
-    step = processor_module.EO1RestoreRawUint8Step(input_features=build_input_features())
-
-    transition = create_transition(
-        observation={"observation.image": bad_image},
-    )
-
-    with pytest.raises(ValueError):
-        step(transition)
+    assert torch.equal(restored, raw_image[0])
+    assert messages[0][1]["content"][1]["text"].endswith("pick<|vla|>")
+    assert messages[1][1]["content"][1]["text"].endswith("place<|vla|>")
 
 
 def test_eo1_qwen_processor_uses_right_padding_for_supervised_batches(monkeypatch):
@@ -201,5 +172,6 @@ def test_make_eo1_pre_post_processors_keeps_visual_feature_shapes(monkeypatch):
     )
 
     assert transformed[PipelineFeatureType.OBSERVATION]["observation.image"].shape == (3, 16, 16)
-    assert "EO1RestoreRawUint8Step" in [type(step).__name__ for step in preprocessor.steps]
+    assert "EO1ConversationTemplateStep" in [type(step).__name__ for step in preprocessor.steps]
+    assert "EO1RestoreRawUint8Step" not in [type(step).__name__ for step in preprocessor.steps]
     assert "EO1ImageSmartResizeStep" not in [type(step).__name__ for step in preprocessor.steps]

@@ -200,6 +200,16 @@ def test_eo1_config_applies_requested_attn_implementation_without_mutating_vlm_c
     assert config.vlm_config == original_vlm_config
 
 
+def test_eo1_config_resolves_flash_attention_2_to_sdpa_when_compiling():
+    config = make_test_config(attn_implementation="flash_attention_2", compile_model=True)
+
+    assert config.attn_implementation == "flash_attention_2"
+    assert config.resolved_attn_implementation == "sdpa"
+    assert config.vlm_backbone_config._attn_implementation == "sdpa"
+    assert config.text_config._attn_implementation == "sdpa"
+    assert config.vision_config._attn_implementation == "sdpa"
+
+
 def test_eo1_config_keeps_provided_vlm_config_without_reloading(monkeypatch):
     seed_config = make_test_config()
     custom_vlm_config = deepcopy(seed_config.vlm_config)
@@ -220,15 +230,22 @@ def test_eo1_config_keeps_provided_vlm_config_without_reloading(monkeypatch):
 
 
 def test_eo1_config_roundtrip_persists_requested_attn_implementation(tmp_path):
-    config = make_test_config(attn_implementation="flash_attention_2")
+    config = make_test_config(
+        attn_implementation="flash_attention_2",
+        compile_model=True,
+        compile_mode="reduce-overhead",
+    )
 
     config._save_pretrained(tmp_path)
     reloaded = PreTrainedConfig.from_pretrained(tmp_path)
 
     assert isinstance(reloaded, EO1Config)
     assert reloaded.attn_implementation == "flash_attention_2"
+    assert reloaded.compile_model is True
+    assert reloaded.compile_mode == "reduce-overhead"
+    assert reloaded.resolved_attn_implementation == "sdpa"
     assert isinstance(reloaded.vlm_config, dict)
-    assert reloaded.vlm_backbone_config._attn_implementation == "flash_attention_2"
+    assert reloaded.vlm_backbone_config._attn_implementation == "sdpa"
 
 
 def test_eo1_bfloat16_backbone_and_fp32_flow_head():
@@ -250,6 +267,44 @@ def test_eo1_state_proj_uses_max_state_dim():
 
     assert model.state_proj.in_features == config.max_state_dim
     assert model.action_in_proj.in_features == config.max_action_dim
+
+
+def test_eo1_model_does_not_compile_when_disabled(monkeypatch):
+    config = make_test_config(dtype="bfloat16", compile_model=False)
+    compile_calls: list[tuple[object, str | None]] = []
+
+    def fake_compile(fn, *, mode=None, **kwargs):
+        compile_calls.append((fn, mode))
+        return fn
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+
+    EO1VisionFlowMatchingModel(config, DummyVLMBackbone(config.text_config.hidden_size))
+
+    assert compile_calls == []
+
+
+def test_eo1_model_compiles_forward_and_sample_actions(monkeypatch):
+    config = make_test_config(dtype="bfloat16", compile_model=True, compile_mode="reduce-overhead")
+    compile_calls: list[tuple[str, str | None]] = []
+    matmul_precisions: list[str] = []
+    monkeypatch.setattr(torch._dynamo.config, "suppress_errors", False)
+
+    def fake_compile(fn, *, mode=None, **kwargs):
+        compile_calls.append((fn.__name__, mode))
+        return fn
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    monkeypatch.setattr(torch, "set_float32_matmul_precision", matmul_precisions.append)
+
+    EO1VisionFlowMatchingModel(config, DummyVLMBackbone(config.text_config.hidden_size))
+
+    assert matmul_precisions == ["high"]
+    assert torch._dynamo.config.suppress_errors is True
+    assert compile_calls == [
+        ("sample_actions", "reduce-overhead"),
+        ("forward", "reduce-overhead"),
+    ]
 
 
 def test_eo1_gradient_checkpointing_enable_propagates_to_backbone():
@@ -320,6 +375,34 @@ def test_eo1_policy_forwards_attn_implementation_to_vlm_from_pretrained(monkeypa
     assert captured["kwargs"] == {
         "dtype": config.dtype,
         "attn_implementation": "flash_attention_2",
+    }
+
+
+def test_eo1_policy_falls_back_to_sdpa_for_compile_with_flash_attention_2(monkeypatch):
+    config = make_test_config(dtype="bfloat16", compile_model=True, attn_implementation="flash_attention_2")
+    config.input_features["observation.image"] = PolicyFeature(type=FeatureType.VISUAL, shape=(3, 224, 224))
+
+    captured: dict[str, object] = {}
+
+    def fake_from_pretrained(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return DummyVLMBackbone(
+            config.text_config.hidden_size,
+            resolved_attn_implementation=kwargs.get("attn_implementation"),
+        )
+
+    monkeypatch.setattr(
+        "lerobot.policies.eo1.modeling_eo1.Qwen2_5_VLForConditionalGeneration.from_pretrained",
+        fake_from_pretrained,
+    )
+
+    EO1Policy(config)
+
+    assert captured["args"] == (config.vlm_base,)
+    assert captured["kwargs"] == {
+        "dtype": config.dtype,
+        "attn_implementation": "sdpa",
     }
 
 

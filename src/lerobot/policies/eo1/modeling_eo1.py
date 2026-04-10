@@ -70,13 +70,20 @@ class EO1Policy(PreTrainedPolicy):
         super().__init__(config)
         config.validate_features()
         self.config = config
+        resolved_attn_implementation = config.resolved_attn_implementation
+
+        if resolved_attn_implementation != config.attn_implementation:
+            logger.warning(
+                "EO1 torch.compile is not compatible with flash_attention_2; falling back to %s.",
+                resolved_attn_implementation,
+            )
 
         if config.pretrained_path is None:
             # Initialize from pretrained VLM
             vlm_backbone = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                 config.vlm_base,
                 dtype=config.dtype,
-                attn_implementation=config.attn_implementation,
+                attn_implementation=resolved_attn_implementation,
             )
         else:
             vlm_backbone = Qwen2_5_VLForConditionalGeneration(config.vlm_backbone_config)
@@ -221,6 +228,12 @@ class EO1VisionFlowMatchingModel(nn.Module):
         self.action_time_mlp_in = nn.Linear(self.hidden_size * 2, self.hidden_size, dtype=torch.float32)
         self.action_time_mlp_out = nn.Linear(self.hidden_size, self.hidden_size, dtype=torch.float32)
         self.gradient_checkpointing_enabled = False
+
+        if config.compile_model:
+            torch.set_float32_matmul_precision("high")
+            torch._dynamo.config.suppress_errors = True
+            self.sample_actions = torch.compile(self.sample_actions, mode=config.compile_mode)
+            self.forward = torch.compile(self.forward, mode=config.compile_mode)
 
     def get_input_embeddings(self):
         return self.vlm_backbone.get_input_embeddings()

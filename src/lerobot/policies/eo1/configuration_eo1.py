@@ -68,6 +68,8 @@ class EO1Config(PreTrainedConfig):
 
     # Training settings.
     gradient_checkpointing: bool = False  # Enable gradient checkpointing for memory optimization
+    compile_model: bool = False  # Whether to use torch.compile for model optimization
+    compile_mode: str = "max-autotune"  # Torch compile mode
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -105,10 +107,16 @@ class EO1Config(PreTrainedConfig):
             self.vlm_config = Qwen2_5_VLConfig.from_pretrained(self.vlm_base).to_dict()
 
     @property
+    def resolved_attn_implementation(self) -> str | None:
+        if self.compile_model and self.attn_implementation == "flash_attention_2":
+            return "sdpa"
+        return self.attn_implementation
+
+    @property
     def vlm_backbone_config(self) -> Qwen2_5_VLConfig:
         config_dict = deepcopy(self.vlm_config)
-        if self.attn_implementation is not None:
-            config_dict["attn_implementation"] = self.attn_implementation
+        if self.resolved_attn_implementation is not None:
+            config_dict["attn_implementation"] = self.resolved_attn_implementation
         return Qwen2_5_VLConfig(**config_dict)
 
     @property

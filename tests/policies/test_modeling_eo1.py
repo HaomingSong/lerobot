@@ -286,12 +286,12 @@ def test_eo1_model_does_not_compile_when_disabled(monkeypatch):
 
 def test_eo1_model_compiles_forward_and_sample_actions(monkeypatch):
     config = make_test_config(dtype="bfloat16", compile_model=True, compile_mode="reduce-overhead")
-    compile_calls: list[tuple[str, str | None]] = []
+    compile_calls: list[tuple[str, str | None, bool | None]] = []
     matmul_precisions: list[str] = []
     monkeypatch.setattr(torch._dynamo.config, "suppress_errors", False)
 
     def fake_compile(fn, *, mode=None, **kwargs):
-        compile_calls.append((fn.__name__, mode))
+        compile_calls.append((fn.__name__, mode, kwargs.get("dynamic")))
         return fn
 
     monkeypatch.setattr(torch, "compile", fake_compile)
@@ -302,9 +302,25 @@ def test_eo1_model_compiles_forward_and_sample_actions(monkeypatch):
     assert matmul_precisions == ["high"]
     assert torch._dynamo.config.suppress_errors is True
     assert compile_calls == [
-        ("sample_actions", "reduce-overhead"),
-        ("forward", "reduce-overhead"),
+        ("sample_actions", "reduce-overhead", None),
+        ("forward", "reduce-overhead", None),
     ]
+
+
+def test_eo1_contiguous_action_positions():
+    config = make_test_config(dtype="bfloat16")
+    model = EO1VisionFlowMatchingModel(config, DummyVLMBackbone(config.text_config.hidden_size))
+
+    action_mask = torch.tensor(
+        [
+            [False, False, True, True, True],
+            [False, True, True, True, False],
+        ]
+    )
+
+    positions = model._get_contiguous_action_positions(action_mask, action_length=3)
+
+    torch.testing.assert_close(positions, torch.tensor([[2, 3, 4], [1, 2, 3]]))
 
 
 def test_eo1_gradient_checkpointing_enable_propagates_to_backbone():
@@ -581,7 +597,7 @@ def test_eo1_embed_prefix_visual_branch_uses_manual_checkpointing(monkeypatch):
 
     assert inputs_embeds.shape == (1, input_ids.shape[1], config.text_config.hidden_size)
     assert backbone.image_feature_calls
-    assert calls == ["input_embed_func", "image_embed_func"]
+    assert calls == ["input_embed_func", "_get_image_embeds_eager"]
 
 
 def test_eo1_padded_actions_skip_diffusion_noise():
@@ -630,16 +646,21 @@ def test_eo1_padded_actions_skip_diffusion_noise():
 def test_eo1_flow_loss_only_averages_valid_actions():
     losses = torch.tensor(
         [
-            [1.0, 3.0],
-            [10.0, 12.0],
+            [[1.0, 3.0], [10.0, 12.0]],
+            [[5.0, 7.0], [9.0, 11.0]],
         ],
         dtype=torch.float32,
     )
-    action_is_pad = torch.tensor([[False, True]])
+    action_is_pad = torch.tensor(
+        [
+            [False, True],
+            [False, False],
+        ]
+    )
 
     reduced = EO1VisionFlowMatchingModel.reduce_flow_matching_loss(losses, action_is_pad)
 
-    assert reduced.item() == pytest.approx(2.0)
+    assert reduced.item() == pytest.approx(6.0)
 
 
 def test_eo1_sample_actions_supports_batched_eval_denoising():

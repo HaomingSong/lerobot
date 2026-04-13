@@ -60,7 +60,7 @@ class EO1Config(PreTrainedConfig):
     action_act: str = "linear"
 
     # Model dtype.
-    dtype: str = "bfloat16"  # Options: "auto", "bfloat16", "float32"
+    dtype: str = "bfloat16"  # Options: "bfloat16", "float32"
     force_fp32_autocast: bool = False
 
     # Optional attention backend request passed through to the Qwen backbone.

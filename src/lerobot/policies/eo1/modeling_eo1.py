@@ -82,7 +82,7 @@ class EO1Policy(PreTrainedPolicy):
         else:
             vlm_backbone = Qwen2_5_VLForConditionalGeneration._from_config(
                 config.vlm_backbone_config,
-                dtype=config.dtype,
+                dtype=config.vlm_backbone_config.dtype if config.dtype == "auto" else config.dtype,
             )
 
         self.model = EO1VisionFlowMatchingModel(config, vlm_backbone)

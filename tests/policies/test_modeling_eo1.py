@@ -319,7 +319,7 @@ def test_eo1_policy_forwards_attn_implementation_to_vlm_from_pretrained(monkeypa
 
     assert captured["args"] == (config.vlm_base,)
     assert captured["kwargs"] == {
-        "dtype": torch.bfloat16,
+        "dtype": "bfloat16",
         "attn_implementation": "flash_attention_2",
     }
 
@@ -350,10 +350,38 @@ def test_eo1_policy_applies_attn_implementation_to_constructed_vlm_config(monkey
     EO1Policy(config)
 
     vlm_config = captured["vlm_config"]
-    assert captured["kwargs"] == {"dtype": torch.bfloat16}
+    assert captured["kwargs"] == {"dtype": "bfloat16"}
     assert vlm_config._attn_implementation == "sdpa"
     assert vlm_config.text_config._attn_implementation == "sdpa"
     assert vlm_config.vision_config._attn_implementation == "sdpa"
+
+
+def test_eo1_policy_uses_backbone_default_dtype_for_auto_from_config(monkeypatch):
+    config = make_test_config(
+        dtype="auto",
+        pretrained_path=Path("/tmp/fake-pretrained-policy"),
+        attn_implementation="sdpa",
+    )
+    config.input_features["observation.image"] = PolicyFeature(type=FeatureType.VISUAL, shape=(3, 224, 224))
+
+    captured: dict[str, object] = {}
+
+    def fake_from_config(vlm_config, **kwargs):
+        captured["vlm_config"] = vlm_config
+        captured["kwargs"] = kwargs
+        return DummyVLMBackbone(
+            vlm_config.text_config.hidden_size,
+            resolved_attn_implementation=vlm_config._attn_implementation,
+        )
+
+    monkeypatch.setattr(
+        "lerobot.policies.eo1.modeling_eo1.Qwen2_5_VLForConditionalGeneration._from_config",
+        fake_from_config,
+    )
+
+    EO1Policy(config)
+
+    assert captured["kwargs"] == {"dtype": config.vlm_backbone_config.dtype}
 
 
 def test_eo1_apply_checkpoint_only_runs_when_training_and_grad_enabled(monkeypatch):
@@ -390,7 +418,7 @@ def test_eo1_prepare_helpers_pad_without_mutating_batch_contract():
 
 
 def test_eo1_embed_suffix_stays_fp32_inside_global_autocast():
-    config = make_test_config(dtype="bfloat16")
+    config = make_test_config(dtype="bfloat16", force_fp32_autocast=True)
     model = EO1VisionFlowMatchingModel(config, DummyVLMBackbone(config.text_config.hidden_size))
 
     timestep = torch.tensor([0.5], dtype=torch.float32)

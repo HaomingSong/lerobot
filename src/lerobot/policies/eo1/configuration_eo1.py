@@ -59,8 +59,12 @@ class EO1Config(PreTrainedConfig):
     num_action_layers: int = 2
     action_act: str = "linear"
 
-    # Model dtype.
-    dtype: str = "bfloat16"  # Options: "bfloat16", "float32"
+    # Policy-level dtype request for the Qwen backbone.
+    # - "auto": follow the backbone config/checkpoint default dtype. For Qwen2.5-VL this resolves to bf16.
+    #           The EO1 flow-matching head still keeps its own parameters in fp32.
+    # - "bfloat16": force the backbone to initialize/load in bf16 regardless of the saved config default.
+    # - "float32": force the backbone to initialize/load in fp32 for maximum numerical conservatism.
+    dtype: str = "auto"  # Options: "auto", "bfloat16", "float32"
     force_fp32_autocast: bool = False
 
     # Optional attention backend request passed through to the Qwen backbone.

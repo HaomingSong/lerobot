@@ -79,7 +79,10 @@ class EO1Policy(PreTrainedPolicy):
                 attn_implementation=config.attn_implementation,
             )
         else:
-            vlm_backbone = Qwen2_5_VLForConditionalGeneration(config.vlm_backbone_config)
+            vlm_backbone = Qwen2_5_VLForConditionalGeneration._from_config(
+                config.vlm_backbone_config,
+                dtype=config.dtype,
+            )
 
         self.model = EO1VisionFlowMatchingModel(config, vlm_backbone)
         if config.gradient_checkpointing:
@@ -205,7 +208,8 @@ class EO1VisionFlowMatchingModel(nn.Module):
         super().__init__()
 
         self.config = config
-        self.vlm_backbone = vlm_backbone.to(dtype=getattr(torch, config.dtype))
+        # Preserve the backbone dtype selected at construction time so Qwen's fp32 rotary buffers stay intact.
+        self.vlm_backbone = vlm_backbone
         self.hidden_size = self.vlm_backbone.config.text_config.hidden_size
         max_state_dim = config.max_state_dim
         max_action_dim = config.max_action_dim

@@ -233,7 +233,8 @@ def test_eo1_config_roundtrip_persists_requested_attn_implementation(tmp_path):
 
 def test_eo1_bfloat16_backbone_and_fp32_flow_head():
     config = make_test_config(dtype="bfloat16")
-    model = EO1VisionFlowMatchingModel(config, DummyVLMBackbone(config.text_config.hidden_size))
+    backbone = DummyVLMBackbone(config.text_config.hidden_size).to(dtype=torch.bfloat16)
+    model = EO1VisionFlowMatchingModel(config, backbone)
 
     assert model.hidden_size == config.text_config.hidden_size
     assert model.vlm_backbone.embedding.weight.dtype == torch.bfloat16
@@ -318,7 +319,7 @@ def test_eo1_policy_forwards_attn_implementation_to_vlm_from_pretrained(monkeypa
 
     assert captured["args"] == (config.vlm_base,)
     assert captured["kwargs"] == {
-        "dtype": config.dtype,
+        "dtype": torch.bfloat16,
         "attn_implementation": "flash_attention_2",
     }
 
@@ -333,22 +334,23 @@ def test_eo1_policy_applies_attn_implementation_to_constructed_vlm_config(monkey
 
     captured: dict[str, object] = {}
 
-    class DummyConstructedQwenBackbone:
-        def __new__(cls, vlm_config):
-            captured["vlm_config"] = vlm_config
-            return DummyVLMBackbone(
-                vlm_config.text_config.hidden_size,
-                resolved_attn_implementation=vlm_config._attn_implementation,
-            )
+    def fake_from_config(vlm_config, **kwargs):
+        captured["vlm_config"] = vlm_config
+        captured["kwargs"] = kwargs
+        return DummyVLMBackbone(
+            vlm_config.text_config.hidden_size,
+            resolved_attn_implementation=vlm_config._attn_implementation,
+        )
 
     monkeypatch.setattr(
-        "lerobot.policies.eo1.modeling_eo1.Qwen2_5_VLForConditionalGeneration",
-        DummyConstructedQwenBackbone,
+        "lerobot.policies.eo1.modeling_eo1.Qwen2_5_VLForConditionalGeneration._from_config",
+        fake_from_config,
     )
 
     EO1Policy(config)
 
     vlm_config = captured["vlm_config"]
+    assert captured["kwargs"] == {"dtype": torch.bfloat16}
     assert vlm_config._attn_implementation == "sdpa"
     assert vlm_config.text_config._attn_implementation == "sdpa"
     assert vlm_config.vision_config._attn_implementation == "sdpa"
@@ -727,7 +729,8 @@ def test_eo1_sample_actions_raises_for_misaligned_action_spans():
 
 def test_eo1_state_dict_keeps_flow_head_weights_in_fp32():
     config = make_test_config(dtype="bfloat16")
-    model = EO1VisionFlowMatchingModel(config, DummyVLMBackbone(config.text_config.hidden_size))
+    backbone = DummyVLMBackbone(config.text_config.hidden_size).to(dtype=torch.bfloat16)
+    model = EO1VisionFlowMatchingModel(config, backbone)
 
     state_dict = model.state_dict()
 

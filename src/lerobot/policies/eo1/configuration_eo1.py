@@ -61,6 +61,7 @@ class EO1Config(PreTrainedConfig):
 
     # Model dtype.
     dtype: str = "bfloat16"  # Options: "auto", "bfloat16", "float32"
+    force_fp32_autocast: bool = False
 
     # Optional attention backend request passed through to the Qwen backbone.
     # Common values: None, "eager", "sdpa", "flash_attention_2".

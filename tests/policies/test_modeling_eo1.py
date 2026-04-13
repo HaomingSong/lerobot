@@ -665,6 +665,71 @@ def test_eo1_sample_actions_supports_batched_eval_denoising():
         )
 
 
+def test_eo1_sample_actions_crops_cache_back_to_prefix_each_step(monkeypatch):
+    config = make_test_config(dtype="bfloat16", chunk_size=4, n_action_steps=4, num_denoise_steps=3)
+    model = EO1VisionFlowMatchingModel(config, DummyVLMBackbone(config.text_config.hidden_size))
+
+    class TrackingCache:
+        def __init__(self, seq_length: int):
+            self.seq_length = seq_length
+            self.crop_calls: list[int] = []
+
+        def get_seq_length(self) -> int:
+            return self.seq_length
+
+        def crop(self, prefix_len: int) -> None:
+            self.crop_calls.append(prefix_len)
+            self.seq_length = prefix_len
+
+    denoise_cache_lengths: list[int] = []
+    final_cache: TrackingCache | None = None
+
+    def fake_model(
+        *,
+        position_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        past_key_values: TrackingCache | None = None,
+        use_cache: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
+        **kwargs,
+    ):
+        nonlocal final_cache
+        assert inputs_embeds is not None
+        if past_key_values is None:
+            cache = TrackingCache(inputs_embeds.shape[1])
+            final_cache = cache
+        else:
+            denoise_cache_lengths.append(past_key_values.get_seq_length())
+            past_key_values.seq_length += inputs_embeds.shape[1]
+            cache = past_key_values
+        return SimpleNamespace(last_hidden_state=inputs_embeds, past_key_values=cache)
+
+    monkeypatch.setattr(model.vlm_backbone, "model", fake_model)
+
+    action_token_id = 7
+    state_token_id = 9
+    input_ids = torch.tensor(
+        [[0, 0, state_token_id, 21, action_token_id, action_token_id, action_token_id, action_token_id]]
+    )
+    attention_mask = torch.tensor([[0, 0, 1, 1, 1, 1, 1, 1]], dtype=torch.long)
+    states = torch.randn(1, config.max_state_dim, dtype=torch.float32)
+
+    actions = model.sample_actions(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        states=states,
+        state_token_id=state_token_id,
+        action_token_id=action_token_id,
+    )
+
+    assert actions.shape == (1, config.chunk_size, config.max_action_dim)
+    assert denoise_cache_lengths == [4, 4, 4]
+    assert final_cache is not None
+    assert final_cache.crop_calls == [4, 4, 4]
+
+
 def test_eo1_sample_actions_supports_single_sample_eval_denoising():
     config = make_test_config(dtype="bfloat16", chunk_size=4, n_action_steps=4, num_denoise_steps=2)
     model = EO1VisionFlowMatchingModel(config, DummyVLMBackbone(config.text_config.hidden_size))

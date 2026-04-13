@@ -266,47 +266,6 @@ class EO1VisionFlowMatchingModel(nn.Module):
         time = time_beta * 0.999 + 0.001
         return time
 
-    def build_flow_matching_targets(
-        self,
-        action: torch.Tensor,
-        action_is_pad: torch.Tensor | None,
-        device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Sample diffusion targets while keeping padded actions deterministic.
-
-        Padded action slots are excluded from the denoising loss, so they should not
-        receive random noise injections that can still perturb the transformer context.
-        """
-        time = self.sample_time(action.shape[0], device)  # (b,)
-        time_expanded = time[:, None, None].expand(-1, action.shape[1], 1).clone()  # (b, h, 1)
-
-        pad_mask = None
-        if action_is_pad is not None:
-            pad_mask = action_is_pad.to(device=device, dtype=torch.bool).unsqueeze(-1)
-            time_expanded = time_expanded.masked_fill(pad_mask, 0.0)
-
-        noise = self.sample_noise(action.shape, device)
-        x_t = time_expanded * noise + (1 - time_expanded) * action
-        u_t = noise - action
-
-        if pad_mask is not None:
-            u_t = u_t.masked_fill(pad_mask, 0.0)
-
-        return time, x_t, u_t
-
-    @staticmethod
-    def reduce_flow_matching_loss(
-        losses: torch.Tensor,
-        action_is_pad: torch.Tensor | None,
-    ) -> torch.Tensor:
-        if action_is_pad is None:
-            return losses.mean()
-
-        valid_mask = (~action_is_pad).reshape(-1, 1).to(device=losses.device, dtype=losses.dtype)
-        valid_losses = losses * valid_mask
-        valid_elements = valid_mask.sum() * losses.shape[-1]
-        return valid_losses.sum() / valid_elements.clamp_min(1)
-
     def replace_special_embeddings(
         self,
         input_ids: torch.LongTensor,
@@ -415,7 +374,6 @@ class EO1VisionFlowMatchingModel(nn.Module):
         image_grid_thw: torch.LongTensor | None = None,
         states: torch.Tensor | None = None,
         action: torch.Tensor | None = None,
-        action_is_pad: torch.Tensor | None = None,
         state_token_id: int = 151669,
         action_token_id: int = 151666,
         **kwargs,
@@ -430,15 +388,14 @@ class EO1VisionFlowMatchingModel(nn.Module):
         )
 
         if action is not None:
-            noise_mask = input_ids == action_token_id
-            mask = noise_mask
-
-            time, x_t, u_t = self.build_flow_matching_targets(action, action_is_pad, inputs_embeds.device)
-
+            time = self.sample_time(action.shape[0], inputs_embeds.device)
+            noise = self.sample_noise(action.shape, inputs_embeds.device)
+            time_expanded = time[:, None, None]
+            x_t = time_expanded * noise + (1 - time_expanded) * action
+            u_t = noise - action
             action_time_embs = self.embed_suffix(time, x_t)
-            mask_expanded = mask.unsqueeze(-1).expand_as(inputs_embeds)
-            action_mask = mask_expanded.to(inputs_embeds.device)
-
+            action_mask = (input_ids == action_token_id).unsqueeze(-1).expand_as(inputs_embeds)
+            action_mask = action_mask.to(inputs_embeds.device)
             action_time_embs = action_time_embs.to(inputs_embeds.device, inputs_embeds.dtype)
             inputs_embeds = inputs_embeds.masked_scatter(action_mask, action_time_embs)
 
@@ -484,9 +441,7 @@ class EO1VisionFlowMatchingModel(nn.Module):
             v_t = self._apply_checkpoint(action_out_proj_func, action_hidden_states)
             u_t = u_t.reshape(v_t.shape)
             v_t = v_t.to(dtype=u_t.dtype)
-
-            losses = F.mse_loss(u_t, v_t, reduction="none")
-            fm_loss = self.reduce_flow_matching_loss(losses, action_is_pad)
+            fm_loss = F.mse_loss(u_t, v_t, reduction="mean")
 
         return EO1VisionFlowMatchingOutputWithPast(
             fm_loss=fm_loss,

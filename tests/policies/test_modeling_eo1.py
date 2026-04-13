@@ -501,7 +501,7 @@ def test_eo1_embed_prefix_visual_branch_uses_manual_checkpointing(monkeypatch):
     assert calls == ["input_embed_func", "image_embed_func"]
 
 
-def test_eo1_padded_actions_skip_diffusion_noise():
+def test_eo1_padded_actions_follow_standard_diffusion_targets():
     config = make_test_config(dtype="bfloat16")
     model = EO1VisionFlowMatchingModel(config, DummyVLMBackbone(config.text_config.hidden_size))
 
@@ -538,25 +538,53 @@ def test_eo1_padded_actions_skip_diffusion_noise():
 
     assert outputs.fm_loss is not None
     assert torch.allclose(
-        captured["noisy_actions"][0, : config.chunk_size // 2],
-        torch.full((config.chunk_size // 2, config.max_action_dim), 2.0, dtype=torch.float32),
+        captured["noisy_actions"],
+        torch.full((1, config.chunk_size, config.max_action_dim), 2.0, dtype=torch.float32),
     )
-    assert torch.count_nonzero(captured["noisy_actions"][0, config.chunk_size // 2 :]).item() == 0
 
 
-def test_eo1_flow_loss_only_averages_valid_actions():
-    losses = torch.tensor(
-        [
-            [1.0, 3.0],
-            [10.0, 12.0],
-        ],
+def test_eo1_flow_loss_keeps_padded_actions_in_reduction():
+    config = make_test_config(dtype="bfloat16")
+    model = EO1VisionFlowMatchingModel(config, DummyVLMBackbone(config.text_config.hidden_size))
+
+    class ZeroActionOutProj(nn.Module):
+        def __init__(self, output_dim: int):
+            super().__init__()
+            self.output_dim = output_dim
+
+        @property
+        def dtype(self):
+            return torch.float32
+
+        def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+            return torch.zeros(
+                hidden_states.shape[0],
+                self.output_dim,
+                dtype=torch.float32,
+                device=hidden_states.device,
+            )
+
+    model.sample_time = lambda bsize, device: torch.full((bsize,), 0.5, dtype=torch.float32, device=device)
+    model.sample_noise = lambda shape, device: torch.zeros(shape, dtype=torch.float32, device=device)
+    model.embed_suffix = lambda timestep, noisy_actions: torch.zeros(
+        noisy_actions.shape[0],
+        noisy_actions.shape[1],
+        config.text_config.hidden_size,
         dtype=torch.float32,
+        device=noisy_actions.device,
     )
-    action_is_pad = torch.tensor([[False, True]])
+    model.action_out_proj = ZeroActionOutProj(config.max_action_dim)
 
-    reduced = EO1VisionFlowMatchingModel.reduce_flow_matching_loss(losses, action_is_pad)
+    outputs = model(
+        input_ids=torch.full((1, config.chunk_size), 7, dtype=torch.long),
+        attention_mask=torch.ones(1, config.chunk_size, dtype=torch.long),
+        action=torch.ones(1, config.chunk_size, config.max_action_dim, dtype=torch.float32),
+        action_is_pad=torch.tensor([[False] + [True] * (config.chunk_size - 1)]),
+        action_token_id=7,
+    )
 
-    assert reduced.item() == pytest.approx(2.0)
+    assert outputs.fm_loss is not None
+    assert outputs.fm_loss.item() == pytest.approx(1.0)
 
 
 def test_eo1_sample_actions_supports_batched_eval_denoising():

@@ -92,7 +92,9 @@ class EO1ConversationTemplateStep(ComplementaryDataProcessorStep):
 
         # LeRobot visual observations reach in processor as float32 tensors in [0, 1].
         # Convert to uint8 in [0, 255] to meet the input requirement of Qwen2.5-VL-3B-Instruct.
-        images = {key: observation[key].mul(255.0).round().to(torch.uint8) for key in self._image_keys}
+        images = {
+            key: observation[key].clamp(0, 1).mul(255.0).round().to(torch.uint8) for key in self._image_keys
+        }
         messages = []
         for i in range(len(tasks)):
             content = [

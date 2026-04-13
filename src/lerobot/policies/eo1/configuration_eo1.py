@@ -65,7 +65,7 @@ class EO1Config(PreTrainedConfig):
     # - "bfloat16": force the backbone to initialize/load in bf16 regardless of the saved config default.
     # - "float32": force the backbone to initialize/load in fp32 for maximum numerical conservatism.
     dtype: str = "auto"  # Options: "auto", "bfloat16", "float32"
-    force_fp32_autocast: bool = False
+    force_fp32_autocast: bool = True
 
     # Optional attention backend request passed through to the Qwen backbone.
     # Common values: None, "eager", "sdpa", "flash_attention_2".

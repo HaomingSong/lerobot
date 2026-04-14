@@ -41,16 +41,11 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class EO1VisionFlowMatchingOutputWithPast(ModelOutput):
+class EO1FlowMatchingOutput(ModelOutput):
     fm_loss: torch.FloatTensor | None = None
-    # logits: torch.FloatTensor | None = None
-    # past_key_values: list[torch.FloatTensor] | None = None
-    # hidden_states: torch.FloatTensor | None = None
-    # attentions: torch.FloatTensor | None = None
-    # rope_deltas: torch.LongTensor | None = None
 
 
-def pad_vector(vector, new_dim):
+def pad_vector(vector: Tensor, new_dim: int) -> Tensor:
     """Pad the last dimension of a vector to new_dim with zeros.
 
     Can be (batch_size x sequence_length x features_dimension)
@@ -95,10 +90,14 @@ class EO1Policy(PreTrainedPolicy):
     def reset(self):
         self._action_queue = deque(maxlen=self.config.n_action_steps)
 
+    @staticmethod
+    def _get_model_inputs(batch: dict[str, Tensor], excluded_keys: set[str]) -> dict[str, Tensor]:
+        return {key: value for key, value in batch.items() if key not in excluded_keys}
+
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         state = self.prepare_state(batch.get(OBS_STATE))
         actions = self.prepare_action(batch.get(ACTION))
-        model_inputs = {k: v for k, v in batch.items() if k not in {OBS_STATE, ACTION}}
+        model_inputs = self._get_model_inputs(batch, {OBS_STATE, ACTION})
         outputs = self.model(states=state, action=actions, **model_inputs)
 
         loss = outputs.fm_loss
@@ -110,37 +109,29 @@ class EO1Policy(PreTrainedPolicy):
     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs) -> Tensor:
         self.eval()
 
-        # Prepare inputs
         states = self.prepare_state(batch.get(OBS_STATE))
-        model_inputs = {k: v for k, v in batch.items() if k != OBS_STATE}
+        model_inputs = self._get_model_inputs(batch, {OBS_STATE})
         actions = self.model.sample_actions(states=states, **model_inputs).to(torch.float32)
 
-        # Unpad actions to actual action dimension
         original_action_dim = self.config.output_features[ACTION].shape[0]
         return actions[:, :, :original_action_dim]
 
-    def prepare_state(self, state):
-        """Pad state"""
+    def prepare_state(self, state: Tensor | None) -> Tensor | None:
         if state is None:
             return None
-        state = pad_vector(state, self.config.max_state_dim)
-        return state
+        return pad_vector(state, self.config.max_state_dim)
 
-    def prepare_action(self, action):
-        """Pad action"""
+    def prepare_action(self, action: Tensor | None) -> Tensor | None:
         if action is None:
             return None
-        actions = pad_vector(action, self.config.max_action_dim)
-        return actions
+        return pad_vector(action, self.config.max_action_dim)
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         self.eval()
 
-        # Action queue logic for n_action_steps > 1
         if len(self._action_queue) == 0:
             actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
-            # Transpose to get shape (n_action_steps, batch_size, action_dim)
             self._action_queue.extend(actions.transpose(0, 1))
 
         return self._action_queue.popleft()
@@ -150,11 +141,11 @@ class EO1Policy(PreTrainedPolicy):
 
 
 def create_sinusoidal_pos_embedding(
-    time: torch.tensor,
+    time: Tensor,
     dimension: int,
-    min_period: float = 4e-3,
-    max_period: float = 4.0,
-    device="cpu",
+    min_period: float,
+    max_period: float,
+    device: torch.device | str = "cpu",
 ) -> Tensor:
     """Computes sine-cosine positional embedding vectors for scalar positions."""
     if dimension % 2 != 0:
@@ -276,33 +267,63 @@ class EO1VisionFlowMatchingModel(nn.Module):
         return noise
 
     def sample_time(self, bsize, device):
-        beta_dist = torch.distributions.Beta(concentration1=1.5, concentration0=1.0)
+        beta_dist = torch.distributions.Beta(
+            concentration1=self.config.time_sampling_beta_alpha,
+            concentration0=self.config.time_sampling_beta_beta,
+        )
         time_beta = beta_dist.sample((bsize,)).to(device=device, dtype=torch.float32)
-        time = time_beta * 0.999 + 0.001
+        time = time_beta * self.config.time_sampling_scale + self.config.time_sampling_offset
         return time
 
-    def replace_special_embeddings(
+    def scatter_special_token_features(
         self,
         input_ids: torch.LongTensor,
         inputs_embeds: torch.FloatTensor,
-        special_features: torch.FloatTensor = None,
-        special_token_ids: torch.LongTensor = None,
-    ) -> torch.LongTensor:
-        """Replace the special embeddings with the special features."""
-        if special_features is not None and special_token_ids is not None:
-            n_special_tokens = (input_ids == special_token_ids).sum().item()
-            n_special_features = special_features.shape[0]
-            assert n_special_tokens == n_special_features, (
-                f"Special features and special tokens {special_token_ids} do not match: \
-                tokens: {n_special_tokens}, features {n_special_features}"
+        token_id: int | None,
+        features: torch.FloatTensor | None,
+        feature_name: str,
+    ) -> torch.FloatTensor:
+        if features is None or token_id is None:
+            return inputs_embeds
+
+        num_tokens = int((input_ids == token_id).sum().item())
+        num_features = features.shape[0]
+        if num_tokens != num_features:
+            raise ValueError(
+                f"{feature_name} features do not match token count: tokens={num_tokens}, features={num_features}."
             )
-            mask = input_ids == special_token_ids
-            mask_unsqueezed = mask.unsqueeze(-1)
-            mask_expanded = mask_unsqueezed.expand_as(inputs_embeds)
-            special_mask = mask_expanded.to(inputs_embeds.device)
-            special_features = special_features.to(inputs_embeds.device, inputs_embeds.dtype)
-            inputs_embeds = inputs_embeds.masked_scatter(special_mask, special_features)
-        return inputs_embeds, None
+
+        feature_mask = (input_ids == token_id).unsqueeze(-1).expand_as(inputs_embeds)
+        features = features.to(inputs_embeds.device, inputs_embeds.dtype)
+        return inputs_embeds.masked_scatter(feature_mask.to(inputs_embeds.device), features)
+
+    def _get_action_token_mask(
+        self,
+        input_ids: torch.LongTensor,
+        action_token_id: int,
+        *,
+        require_shared_layout: bool = False,
+    ) -> torch.BoolTensor:
+        action_mask = input_ids == action_token_id
+        token_counts = action_mask.sum(dim=1)
+        if not torch.all(token_counts == self.config.chunk_size):
+            raise ValueError(
+                f"Each sample must contain exactly {self.config.chunk_size} action tokens, got {token_counts.tolist()}."
+            )
+
+        if require_shared_layout and action_mask.ne(action_mask[:1]).any():
+            raise ValueError(
+                "Batch inference expects all samples to share the same action token mask after left padding."
+            )
+
+        return action_mask
+
+    def _infer_action_slice(self, action_mask: torch.BoolTensor) -> slice:
+        act_start = int(action_mask[0].to(torch.int64).argmax().item())
+        act_end = act_start + self.config.chunk_size
+        if not torch.all(action_mask[:, act_start:act_end]):
+            raise ValueError("Action tokens must form a contiguous chunk of length chunk_size.")
+        return slice(act_start, act_end)
 
     def embed_prefix(
         self,
@@ -313,7 +334,7 @@ class EO1VisionFlowMatchingModel(nn.Module):
         states: torch.Tensor | None = None,
         state_token_id: int | None = None,
     ) -> torch.FloatTensor:
-        """Embed the suffix"""
+        """Embed the multimodal prefix consumed by the Qwen backbone."""
         if inputs_embeds is None:
 
             def input_embed_func(input_ids: torch.LongTensor) -> torch.FloatTensor:
@@ -345,8 +366,12 @@ class EO1VisionFlowMatchingModel(nn.Module):
                     return self.state_proj(states)
 
             state_embs = self._apply_checkpoint(state_proj_func, states)
-            inputs_embeds, _ = self.replace_special_embeddings(
-                input_ids, inputs_embeds, state_embs, state_token_id
+            inputs_embeds = self.scatter_special_token_features(
+                input_ids,
+                inputs_embeds,
+                state_token_id,
+                state_embs,
+                feature_name="State",
             )
         return inputs_embeds
 
@@ -368,6 +393,8 @@ class EO1VisionFlowMatchingModel(nn.Module):
         time_embs = create_sinusoidal_pos_embedding(
             timestep,
             self.hidden_size,
+            min_period=self.config.min_period,
+            max_period=self.config.max_period,
             device=action_embs.device,
         )
         time_embs = time_embs.to(dtype=action_embs.dtype)
@@ -397,8 +424,8 @@ class EO1VisionFlowMatchingModel(nn.Module):
         state_token_id: int = 151669,
         action_token_id: int = 151666,
         **kwargs,
-    ) -> EO1VisionFlowMatchingOutputWithPast:
-        """multi-modal forward pass, including image, video, state, action, and language."""
+    ) -> EO1FlowMatchingOutput:
+        """Run the EO1 training forward pass and compute the flow-matching loss."""
         inputs_embeds = self.embed_prefix(
             input_ids,
             pixel_values=pixel_values,
@@ -407,6 +434,7 @@ class EO1VisionFlowMatchingModel(nn.Module):
             state_token_id=state_token_id,
         )
 
+        action_mask = None
         if action is not None:
             time = self.sample_time(action.shape[0], inputs_embeds.device)
             noise = self.sample_noise(action.shape, inputs_embeds.device)
@@ -414,7 +442,8 @@ class EO1VisionFlowMatchingModel(nn.Module):
             x_t = time_expanded * noise + (1 - time_expanded) * action
             u_t = noise - action
             action_time_embs = self.embed_suffix(time, x_t)
-            action_mask = (input_ids == action_token_id).unsqueeze(-1).expand_as(inputs_embeds)
+            action_token_mask = self._get_action_token_mask(input_ids, action_token_id)
+            action_mask = action_token_mask.unsqueeze(-1).expand_as(inputs_embeds)
             action_mask = action_mask.to(inputs_embeds.device)
             action_time_embs = action_time_embs.to(inputs_embeds.device, inputs_embeds.dtype)
             inputs_embeds = inputs_embeds.masked_scatter(action_mask, action_time_embs)
@@ -449,8 +478,9 @@ class EO1VisionFlowMatchingModel(nn.Module):
         hidden_states = self._apply_checkpoint(vlm_forward_func, position_ids, attention_mask, inputs_embeds)
 
         fm_loss = None
-        v_t = None
         if action is not None:
+            if action_mask is None:
+                raise ValueError("Action mask must be defined when action targets are provided.")
             action_hidden_states = hidden_states[action_mask[..., 0]]
 
             def action_out_proj_func(action_hidden_states: torch.FloatTensor) -> torch.FloatTensor:
@@ -465,7 +495,7 @@ class EO1VisionFlowMatchingModel(nn.Module):
             v_t = v_t.to(dtype=u_t.dtype)
             fm_loss = F.mse_loss(u_t, v_t, reduction="mean")
 
-        return EO1VisionFlowMatchingOutputWithPast(
+        return EO1FlowMatchingOutput(
             fm_loss=fm_loss,
         )
 
@@ -484,15 +514,14 @@ class EO1VisionFlowMatchingModel(nn.Module):
         """Sample actions from the model."""
         chunk_size = self.config.chunk_size
 
-        action_mask = input_ids == action_token_id
-        if action_mask.ne(action_mask[:1]).any():
-            raise ValueError(
-                "Batch inference expects all samples to share the same action token mask after left padding."
-            )
-
-        act_start = int(action_mask[0].to(torch.int64).argmax().item())
-        act_end = act_start + chunk_size
-        act_slice = slice(act_start, act_end)
+        action_mask = self._get_action_token_mask(
+            input_ids,
+            action_token_id,
+            require_shared_layout=True,
+        )
+        act_slice = self._infer_action_slice(action_mask)
+        act_start = act_slice.start
+        act_end = act_slice.stop
 
         position_ids, _ = self.vlm_backbone.get_rope_index(
             input_ids,

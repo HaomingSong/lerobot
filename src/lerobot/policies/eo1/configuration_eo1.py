@@ -16,7 +16,6 @@
 
 from copy import deepcopy
 from dataclasses import dataclass, field
-from pathlib import Path
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
@@ -30,15 +29,16 @@ from .qwen2_5_vl.configuration_qwen2_5_vl import (
     Qwen2_5_VLVisionConfig,
 )
 
+DEFAULT_VLM_BASE = "Qwen/Qwen2.5-VL-3B-Instruct"
+SUPPORTED_DTYPES = {"auto", "bfloat16", "float32"}
+
 
 @PreTrainedConfig.register_subclass("eo1")
 @dataclass
 class EO1Config(PreTrainedConfig):
     """Configuration for native EO1 policy integration in LeRobot."""
 
-    # If pretrained path not set, init from VLM huggingface repo.
-    # vlm_base: str = "Qwen/Qwen2.5-VL-3B-Instruct"
-    vlm_base: str = "/mnt/inspurfs/evla2_t/eo-robotics/eo1_artifacts/Qwen2.5-VL-3B-Instruct"
+    vlm_base: str = DEFAULT_VLM_BASE
     vlm_config: dict | None = None
 
     # Vision processor settings.
@@ -58,6 +58,12 @@ class EO1Config(PreTrainedConfig):
     num_denoise_steps: int = 10
     num_action_layers: int = 2
     action_act: str = "linear"
+    time_sampling_beta_alpha: float = 1.5
+    time_sampling_beta_beta: float = 1.0
+    time_sampling_scale: float = 0.999
+    time_sampling_offset: float = 0.001
+    min_period: float = 4e-3
+    max_period: float = 4.0
 
     # Policy-level dtype request for the Qwen backbone.
     # - "auto": follow the backbone config/checkpoint default dtype. For Qwen2.5-VL this resolves to bf16.
@@ -105,6 +111,9 @@ class EO1Config(PreTrainedConfig):
                 f"n_action_steps ({self.n_action_steps}) cannot be greater than chunk_size ({self.chunk_size})"
             )
 
+        if self.dtype not in SUPPORTED_DTYPES:
+            raise ValueError(f"Invalid dtype: {self.dtype}")
+
         # Populate the serialized backbone config only when the caller did not provide one.
         if self.vlm_config is None:
             self.vlm_config = Qwen2_5_VLConfig.from_pretrained(self.vlm_base).to_dict()
@@ -125,7 +134,7 @@ class EO1Config(PreTrainedConfig):
         return self.vlm_backbone_config.vision_config
 
     def validate_features(self) -> None:
-        """Validate and set up input/output features for Groot."""
+        """Validate and set up EO1 input and output features."""
         image_features = [key for key, feat in self.input_features.items() if feat.type == FeatureType.VISUAL]
         if not image_features:
             raise ValueError(
@@ -164,21 +173,12 @@ class EO1Config(PreTrainedConfig):
             num_decay_steps=self.scheduler_decay_steps,
         )
 
-    def get_checkpoint_path(self) -> Path | None:
-        if self.checkpoint_path:
-            return Path(self.checkpoint_path)
-        if self.pretrained_path:
-            return Path(self.pretrained_path)
-        if self.init_mode == "checkpoint":
-            return Path(self.pretrained_name_or_path)
-        return None
-
     @property
     def observation_delta_indices(self) -> None:
         return None
 
     @property
-    def action_delta_indices(self) -> list:
+    def action_delta_indices(self) -> list[int]:
         return list(range(self.chunk_size))
 
     @property

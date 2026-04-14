@@ -20,7 +20,7 @@ from typing import Any
 import torch
 
 from lerobot.configs.types import FeatureType, PipelineFeatureType, PolicyFeature
-from lerobot.policies.eo1.configuration_eo1 import EO1Config
+from lerobot.policies.eo1.configuration_eo1 import DEFAULT_VLM_BASE, EO1Config
 from lerobot.policies.eo1.qwen2_5_vl.processing_qwen2_5_vl import Qwen2_5_VLProcessor
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
@@ -53,6 +53,40 @@ DEFAULT_STATE_TOKEN = "<|state_pad|>"
 STATE_END_TOKEN = "<|state_end|>"
 TASK_VLA_TOKEN = "<|vla|>"
 
+EO1_SPECIAL_TOKENS = (
+    ACTION_START_TOKEN,
+    DEFAULT_ACTION_TOKEN,
+    ACTION_END_TOKEN,
+    STATE_START_TOKEN,
+    DEFAULT_STATE_TOKEN,
+    STATE_END_TOKEN,
+    TASK_VLA_TOKEN,
+)
+
+
+def deserialize_policy_features(
+    input_features: dict[str, PolicyFeature] | dict[str, dict[str, Any]],
+) -> dict[str, PolicyFeature]:
+    if not input_features:
+        return {}
+
+    first_feature = next(iter(input_features.values()))
+    if isinstance(first_feature, PolicyFeature):
+        return dict(input_features)
+
+    return {
+        key: PolicyFeature(type=FeatureType(feature["type"]), shape=tuple(feature["shape"]))
+        for key, feature in input_features.items()
+    }
+
+
+def ensure_task_list(tasks: Any) -> list[str]:
+    if isinstance(tasks, str):
+        return [tasks]
+    if isinstance(tasks, list) and all(isinstance(task, str) for task in tasks):
+        return tasks
+    raise ValueError("EO1 expects complementary_data['task'] to be a string or a list of strings.")
+
 
 @dataclass
 @ProcessorStepRegistry.register(name="eo1_conversation_template_processor")
@@ -63,17 +97,7 @@ class EO1ConversationTemplateStep(ComplementaryDataProcessorStep):
     _image_keys: list[str] = field(default_factory=list, init=False, repr=False)
 
     def __post_init__(self):
-        # Robust JSON deserialization handling (guard empty maps).
-        if self.input_features:
-            first_val = next(iter(self.input_features.values()))
-            if isinstance(first_val, dict):
-                reconstructed = {}
-                for key, ft_dict in self.input_features.items():
-                    reconstructed[key] = PolicyFeature(
-                        type=FeatureType(ft_dict["type"]), shape=tuple(ft_dict["shape"])
-                    )
-                self.input_features = reconstructed
-
+        self.input_features = deserialize_policy_features(self.input_features)
         self._image_keys = [
             key for key, value in self.input_features.items() if value.type == FeatureType.VISUAL
         ]
@@ -82,6 +106,7 @@ class EO1ConversationTemplateStep(ComplementaryDataProcessorStep):
         tasks = complementary_data.get("task")
         if tasks is None:
             raise ValueError("Task is required for EO1ConversationTemplateStep.")
+        tasks = ensure_task_list(tasks)
 
         observation = self.transition.get(TransitionKey.OBSERVATION)
         if observation is None:
@@ -90,20 +115,23 @@ class EO1ConversationTemplateStep(ComplementaryDataProcessorStep):
         if OBS_STATE in observation and observation[OBS_STATE].shape[0] != len(tasks):
             raise ValueError("Batch size mismatch between observation.state and task list.")
 
-        # LeRobot visual observations reach in processor as float32 tensors in [0, 1].
-        # Convert to uint8 in [0, 255] to meet the input requirement of Qwen2.5-VL-3B-Instruct.
-        images = {
-            key: observation[key].clamp(0, 1).mul(255.0).round().to(torch.uint8) for key in self._image_keys
-        }
+        images = {}
+        for key in self._image_keys:
+            image_batch = observation[key]
+            if image_batch.shape[0] != len(tasks):
+                raise ValueError(f"Batch size mismatch between {key} and task list.")
+            # LeRobot visual observations reach the processor as float32 tensors in [0, 1].
+            # Qwen expects image inputs as uint8 values in [0, 255].
+            images[key] = image_batch.clamp(0, 1).mul(255.0).round().to(torch.uint8)
+
         messages = []
-        for i in range(len(tasks)):
+        action_text = f"{ACTION_START_TOKEN}{DEFAULT_ACTION_TOKEN * self.chunk_size}{ACTION_END_TOKEN}"
+        for batch_index, task in enumerate(tasks):
             content = [
-                *[{"type": "image", "image": images[key][i]} for key in self._image_keys],
+                *[{"type": "image", "image": images[key][batch_index]} for key in self._image_keys],
                 {
                     "type": "text",
-                    "text": (
-                        f"{STATE_START_TOKEN}{DEFAULT_STATE_TOKEN}{STATE_END_TOKEN}{tasks[i]}{TASK_VLA_TOKEN}"
-                    ),
+                    "text": f"{STATE_START_TOKEN}{DEFAULT_STATE_TOKEN}{STATE_END_TOKEN}{task}{TASK_VLA_TOKEN}",
                 },
             ]
             messages.append(
@@ -115,7 +143,7 @@ class EO1ConversationTemplateStep(ComplementaryDataProcessorStep):
                         "content": [
                             {
                                 "type": "text",
-                                "text": f"{ACTION_START_TOKEN}{DEFAULT_ACTION_TOKEN * self.chunk_size}{ACTION_END_TOKEN}",
+                                "text": action_text,
                             }
                         ],
                     },
@@ -148,8 +176,7 @@ class EO1ConversationTemplateStep(ComplementaryDataProcessorStep):
 @dataclass
 @ProcessorStepRegistry.register(name="eo1_qwen_processor")
 class EO1QwenProcessorStep(ComplementaryDataProcessorStep):
-    # processor_name: str = "/mnt/inspurfs/evla2_t/eo-robotics/eo1_artifacts/Qwen2.5-VL-3B-Instruct"
-    processor_name: str = "Qwen/Qwen2.5-VL-3B-Instruct"
+    processor_name: str = DEFAULT_VLM_BASE
     image_min_pixels: int | None = 64 * 28 * 28
     image_max_pixels: int | None = 128 * 28 * 28
 
@@ -159,17 +186,7 @@ class EO1QwenProcessorStep(ComplementaryDataProcessorStep):
 
     def __post_init__(self):
         self._processor = Qwen2_5_VLProcessor.from_pretrained(self.processor_name)
-
-        special_tokens = [
-            ACTION_START_TOKEN,
-            DEFAULT_ACTION_TOKEN,
-            ACTION_END_TOKEN,
-            STATE_START_TOKEN,
-            DEFAULT_STATE_TOKEN,
-            STATE_END_TOKEN,
-            TASK_VLA_TOKEN,
-        ]
-        self._processor.tokenizer.add_tokens(special_tokens, special_tokens=True)
+        self._processor.tokenizer.add_tokens(list(EO1_SPECIAL_TOKENS), special_tokens=True)
         self._state_token_id = self._processor.tokenizer.convert_tokens_to_ids(DEFAULT_STATE_TOKEN)
         self._action_token_id = self._processor.tokenizer.convert_tokens_to_ids(DEFAULT_ACTION_TOKEN)
 
@@ -178,7 +195,8 @@ class EO1QwenProcessorStep(ComplementaryDataProcessorStep):
         if messages is None:
             raise ValueError("Messages are required for EO1QwenProcessorStep.")
 
-        # left padding for batch inference, right padding for training
+        # Rollout batches use left padding so action spans stay aligned across samples.
+        # Supervised batches use right padding to match standard training collation.
         padding_side = "right" if self.transition.get(TransitionKey.ACTION) is not None else "left"
 
         inputs = self._processor.apply_chat_template(

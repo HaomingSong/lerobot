@@ -43,7 +43,6 @@ from lerobot.policies.eo1.processor_eo1 import (
     SYSTEM_MESSAGE,
     TASK_VLA_TOKEN,
     EO1ConversationTemplateStep,
-    EO1ImageSmartResizeStep,
     EO1QwenProcessorStep,
     make_eo1_pre_post_processors,
 )
@@ -270,7 +269,7 @@ def _assert_batch_not_mutated(raw_batch: dict, original_batch: dict) -> None:
             assert current_value == original_value, f"Batch field '{key}' was mutated by preprocessing."
 
 
-def test_eo1_preprocessor_applies_config_rename_map_before_resize():
+def test_eo1_preprocessor_applies_config_rename_map_before_conversation_template():
     config = make_policy_config(
         "eo1",
         pretrained_path="/tmp/eo1-checkpoint",
@@ -296,12 +295,14 @@ def test_eo1_preprocessor_applies_config_rename_map_before_resize():
         for index, step in enumerate(preprocessor.steps)
         if isinstance(step, RenameObservationsProcessorStep)
     )
-    resize_step_index = next(
-        index for index, step in enumerate(preprocessor.steps) if isinstance(step, EO1ImageSmartResizeStep)
+    conversation_step_index = next(
+        index
+        for index, step in enumerate(preprocessor.steps)
+        if isinstance(step, EO1ConversationTemplateStep)
     )
 
     assert rename_step.rename_map == {"observation.images.image2": "observation.images.wrist_image"}
-    assert rename_step_index < resize_step_index
+    assert rename_step_index < conversation_step_index
 
     renamed = rename_step.observation(
         {
@@ -320,7 +321,7 @@ def _assert_processed_batch(
     dataset_stats: dict,
     cfg: TrainPipelineConfig,
     camera_keys: list[str],
-    resized_features: dict[str, torch.Size | tuple[int, ...]],
+    visual_feature_shapes: dict[str, torch.Size | tuple[int, ...]],
 ) -> None:
     batch_size = len(raw_batch["task"])
     raw_action = raw_batch[ACTION]
@@ -361,7 +362,7 @@ def _assert_processed_batch(
     )
 
     for key in camera_keys:
-        expected_shape = tuple(resized_features[key])
+        expected_shape = tuple(visual_feature_shapes[key])
         assert processed_batch[key].shape == (batch_size, *expected_shape)
         assert torch.isfinite(processed_batch[key]).all()
 
@@ -412,8 +413,11 @@ def test_eo1_processor_pipeline_with_libero_dataset():
     cfg.policy.validate_features()
 
     preprocessor, _ = make_eo1_pre_post_processors(cfg.policy, dataset.meta.stats)
-    resize_step = next(step for step in preprocessor.steps if isinstance(step, EO1ImageSmartResizeStep))
-    resized_features = {key: feature.shape for key, feature in resize_step._resized_features.items()}
+    visual_feature_shapes = {
+        key: cfg.policy.input_features[key].shape
+        for key in dataset.meta.camera_keys
+        if key in cfg.policy.input_features
+    }
     dataloader = _build_dataloader(cfg, dataset)
 
     total_frames = 0
@@ -447,7 +451,7 @@ def test_eo1_processor_pipeline_with_libero_dataset():
                 dataset.meta.stats,
                 cfg,
                 dataset.meta.camera_keys,
-                resized_features,
+                visual_feature_shapes,
             )
 
             total_frames += len(raw_batch["task"])
@@ -501,8 +505,11 @@ def test_eo1_processor_pipeline_debug_visualization():
     cfg.policy.validate_features()
 
     preprocessor, _ = make_eo1_pre_post_processors(cfg.policy, dataset.meta.stats)
-    resize_step = next(step for step in preprocessor.steps if isinstance(step, EO1ImageSmartResizeStep))
-    resized_features = {key: feature.shape for key, feature in resize_step._resized_features.items()}
+    visual_feature_shapes = {
+        key: cfg.policy.input_features[key].shape
+        for key in dataset.meta.camera_keys
+        if key in cfg.policy.input_features
+    }
     raw_batch = next(iter(_build_dataloader(cfg, dataset)))
     batch_before_processing = deepcopy(raw_batch)
 
@@ -531,5 +538,5 @@ def test_eo1_processor_pipeline_debug_visualization():
         dataset.meta.stats,
         cfg,
         dataset.meta.camera_keys,
-        resized_features,
+        visual_feature_shapes,
     )

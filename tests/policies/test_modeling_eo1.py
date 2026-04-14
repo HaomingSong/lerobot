@@ -231,6 +231,39 @@ def test_eo1_config_roundtrip_persists_requested_attn_implementation(tmp_path):
     assert reloaded.vlm_backbone_config._attn_implementation == "flash_attention_2"
 
 
+def test_eo1_sample_time_uses_configured_distribution(monkeypatch):
+    config = make_test_config(
+        dtype="bfloat16",
+        time_sampling_beta_alpha=2.0,
+        time_sampling_beta_beta=3.0,
+        time_sampling_scale=0.5,
+        time_sampling_offset=0.25,
+    )
+    model = EO1VisionFlowMatchingModel(config, DummyVLMBackbone(config.text_config.hidden_size))
+
+    captured: dict[str, object] = {}
+
+    class FakeBeta:
+        def __init__(self, concentration1, concentration0):
+            captured["concentration1"] = concentration1
+            captured["concentration0"] = concentration0
+
+        def sample(self, shape):
+            captured["shape"] = shape
+            return torch.full(shape, 0.5, dtype=torch.float32)
+
+    monkeypatch.setattr(torch.distributions, "Beta", FakeBeta)
+
+    sampled_time = model.sample_time(3, torch.device("cpu"))
+
+    assert captured == {
+        "concentration1": 2.0,
+        "concentration0": 3.0,
+        "shape": (3,),
+    }
+    torch.testing.assert_close(sampled_time, torch.full((3,), 0.5, dtype=torch.float32))
+
+
 def test_eo1_bfloat16_backbone_and_fp32_flow_head():
     config = make_test_config(dtype="bfloat16")
     backbone = DummyVLMBackbone(config.text_config.hidden_size).to(dtype=torch.bfloat16)

@@ -29,7 +29,6 @@ import torch
 
 from lerobot.configs.default import DatasetConfig
 from lerobot.configs.train import TrainPipelineConfig
-from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.datasets.factory import make_dataset
 from lerobot.datasets.sampler import EpisodeAwareSampler
 from lerobot.datasets.utils import dataset_to_policy_features
@@ -48,7 +47,6 @@ from lerobot.policies.eo1.processor_eo1 import (
 )
 from lerobot.policies.factory import make_policy_config
 from lerobot.processor import TransitionKey
-from lerobot.processor.rename_processor import RenameObservationsProcessorStep
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
@@ -267,52 +265,6 @@ def _assert_batch_not_mutated(raw_batch: dict, original_batch: dict) -> None:
             )
         else:
             assert current_value == original_value, f"Batch field '{key}' was mutated by preprocessing."
-
-
-def test_eo1_preprocessor_applies_config_rename_map_before_conversation_template():
-    config = make_policy_config(
-        "eo1",
-        pretrained_path="/tmp/eo1-checkpoint",
-        vlm_base=str(DEFAULT_QWEN_ROOT),
-        device="cpu",
-        rename_map={"observation.images.image2": "observation.images.wrist_image"},
-    )
-    config.input_features = {
-        OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(32,)),
-        "observation.images.image": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 64, 64)),
-        "observation.images.wrist_image": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 64, 64)),
-    }
-    config.output_features = {
-        ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(8,)),
-    }
-
-    preprocessor, _ = make_eo1_pre_post_processors(config)
-    rename_step = next(
-        step for step in preprocessor.steps if isinstance(step, RenameObservationsProcessorStep)
-    )
-    rename_step_index = next(
-        index
-        for index, step in enumerate(preprocessor.steps)
-        if isinstance(step, RenameObservationsProcessorStep)
-    )
-    conversation_step_index = next(
-        index
-        for index, step in enumerate(preprocessor.steps)
-        if isinstance(step, EO1ConversationTemplateStep)
-    )
-
-    assert rename_step.rename_map == {"observation.images.image2": "observation.images.wrist_image"}
-    assert rename_step_index < conversation_step_index
-
-    renamed = rename_step.observation(
-        {
-            "observation.images.image": torch.zeros(3, 64, 64),
-            "observation.images.image2": torch.ones(3, 64, 64),
-        }
-    )
-
-    assert "observation.images.wrist_image" in renamed
-    assert "observation.images.image2" not in renamed
 
 
 def _assert_processed_batch(

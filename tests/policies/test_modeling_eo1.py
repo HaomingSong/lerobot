@@ -129,6 +129,7 @@ class DummyVLMBackbone(nn.Module):
                 "position_ids": position_ids,
                 "attention_mask": attention_mask,
                 "inputs_embeds": inputs_embeds,
+                "past_key_values": kwargs.get("past_key_values"),
                 "use_cache": use_cache,
                 "output_hidden_states": output_hidden_states,
                 "return_dict": return_dict,
@@ -605,6 +606,83 @@ def test_eo1_sample_actions_supports_batched_eval_denoising():
             timestep,
             torch.full((batch_size,), expected, dtype=torch.float32),
         )
+
+
+def test_eo1_sample_actions_preserves_inplace_kv_cache_crop_semantics():
+    config = make_test_config(dtype="bfloat16", num_denoise_steps=3)
+    backbone = DummyVLMBackbone(config.text_config.hidden_size)
+    model = EO1VisionFlowMatchingModel(config, backbone)
+
+    class DummyCache:
+        def __init__(self):
+            self.crop_calls: list[int] = []
+
+        def crop(self, prefix_len: int):
+            self.crop_calls.append(prefix_len)
+
+    cache = DummyCache()
+
+    def fake_model(
+        *,
+        position_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        past_key_values=None,
+        use_cache: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
+        **kwargs,
+    ):
+        backbone.model_calls.append(
+            {
+                "position_ids": position_ids,
+                "attention_mask": attention_mask,
+                "inputs_embeds": inputs_embeds,
+                "past_key_values": past_key_values,
+                "use_cache": use_cache,
+                "output_hidden_states": output_hidden_states,
+                "return_dict": return_dict,
+            }
+        )
+        next_cache = cache if past_key_values is None else past_key_values
+        return SimpleNamespace(last_hidden_state=inputs_embeds, past_key_values=next_cache)
+
+    backbone.model = fake_model
+
+    action_token_id = 7
+    state_token_id = 9
+    input_ids = torch.tensor(
+        [
+            [
+                state_token_id,
+                action_token_id,
+                action_token_id,
+                action_token_id,
+                action_token_id,
+                action_token_id,
+                action_token_id,
+                action_token_id,
+                action_token_id,
+                0,
+            ]
+        ]
+    )
+    attention_mask = torch.ones_like(input_ids)
+    states = torch.randn(1, config.max_state_dim, dtype=torch.float32)
+
+    actions = model.sample_actions(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        states=states,
+        state_token_id=state_token_id,
+        action_token_id=action_token_id,
+    )
+
+    assert actions.shape == (1, config.chunk_size, config.max_action_dim)
+    assert cache.crop_calls == [1, 1, 1]
+    assert backbone.model_calls[1]["past_key_values"] is cache
+    assert backbone.model_calls[2]["past_key_values"] is cache
+    assert backbone.model_calls[3]["past_key_values"] is cache
 
 
 def test_eo1_sample_actions_supports_single_sample_eval_denoising():

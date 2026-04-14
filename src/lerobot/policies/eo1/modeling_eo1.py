@@ -548,6 +548,8 @@ class EO1VisionFlowMatchingModel(nn.Module):
         ).to(dtype=self.action_in_proj.weight.dtype)
         dt = -1.0 / self.config.num_denoise_steps
         past_key_values = outputs.past_key_values
+        if past_key_values is None:
+            raise RuntimeError("EO1 sample_actions expected a prefix KV cache when use_cache=True.")
 
         for step in range(self.config.num_denoise_steps):
             time = torch.full(
@@ -559,6 +561,7 @@ class EO1VisionFlowMatchingModel(nn.Module):
             action_time_embs = self.embed_suffix(time, x_t)
             inputs_embeds[:, act_slice] = action_time_embs.to(inputs_embeds.dtype)
 
+            past_key_values.crop(act_start)
             outputs = self.vlm_backbone.model(
                 position_ids=position_ids[..., act_slice],
                 attention_mask=attention_mask[:, :act_end],
@@ -566,6 +569,9 @@ class EO1VisionFlowMatchingModel(nn.Module):
                 inputs_embeds=inputs_embeds[:, act_slice],
                 use_cache=True,
             )
+            past_key_values = outputs.past_key_values
+            if past_key_values is None:
+                raise RuntimeError("EO1 sample_actions lost the denoising KV cache after a suffix forward.")
             with self.flow_head_autocast_context():
                 hidden_states = outputs.last_hidden_state[:, :chunk_size].to(dtype=self.action_out_proj.dtype)
                 v_t = self.action_out_proj(hidden_states)

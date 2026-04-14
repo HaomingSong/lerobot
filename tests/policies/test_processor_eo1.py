@@ -68,10 +68,12 @@ class FakeQwenProcessor:
 
 class FakeQwenProcessorFactory:
     fake_processor: FakeQwenProcessor | None = None
+    last_from_pretrained_kwargs: dict | None = None
 
     @classmethod
-    def from_pretrained(cls, processor_name):
+    def from_pretrained(cls, processor_name, **kwargs):
         cls.fake_processor = FakeQwenProcessor()
+        cls.last_from_pretrained_kwargs = {"processor_name": processor_name, **kwargs}
         return cls.fake_processor
 
 
@@ -122,6 +124,10 @@ def test_eo1_qwen_processor_uses_right_padding_for_supervised_batches(monkeypatc
     output = step(transition)
     fake_processor = FakeQwenProcessorFactory.fake_processor
     assert fake_processor is not None
+    assert FakeQwenProcessorFactory.last_from_pretrained_kwargs == {
+        "processor_name": "dummy",
+        "use_fast": False,
+    }
     kwargs = fake_processor.calls[-1]["kwargs"]
 
     assert kwargs["padding_side"] == "right"
@@ -148,6 +154,10 @@ def test_eo1_qwen_processor_uses_left_padding_for_rollout_batches(monkeypatch):
     step(transition)
     fake_processor = FakeQwenProcessorFactory.fake_processor
     assert fake_processor is not None
+    assert FakeQwenProcessorFactory.last_from_pretrained_kwargs == {
+        "processor_name": "dummy",
+        "use_fast": False,
+    }
 
     assert fake_processor.calls[-1]["kwargs"]["padding_side"] == "left"
 
@@ -175,3 +185,7 @@ def test_make_eo1_pre_post_processors_keeps_visual_feature_shapes(monkeypatch):
     assert "EO1ConversationTemplateStep" in [type(step).__name__ for step in preprocessor.steps]
     assert "EO1RestoreRawUint8Step" not in [type(step).__name__ for step in preprocessor.steps]
     assert "EO1ImageSmartResizeStep" not in [type(step).__name__ for step in preprocessor.steps]
+    assert FakeQwenProcessorFactory.last_from_pretrained_kwargs == {
+        "processor_name": "dummy",
+        "use_fast": False,
+    }

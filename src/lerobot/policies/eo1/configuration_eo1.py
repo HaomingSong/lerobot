@@ -29,16 +29,13 @@ from .qwen2_5_vl.configuration_qwen2_5_vl import (
     Qwen2_5_VLVisionConfig,
 )
 
-DEFAULT_VLM_BASE = "Qwen/Qwen2.5-VL-3B-Instruct"
-SUPPORTED_DTYPES = {"auto", "bfloat16", "float32"}
-
 
 @PreTrainedConfig.register_subclass("eo1")
 @dataclass
 class EO1Config(PreTrainedConfig):
     """Configuration for native EO1 policy integration in LeRobot."""
 
-    vlm_base: str = DEFAULT_VLM_BASE
+    vlm_base: str = "Qwen/Qwen2.5-VL-3B-Instruct"
     vlm_config: dict | None = None
 
     # Vision processor settings.
@@ -110,9 +107,6 @@ class EO1Config(PreTrainedConfig):
             raise ValueError(
                 f"n_action_steps ({self.n_action_steps}) cannot be greater than chunk_size ({self.chunk_size})"
             )
-
-        if self.dtype not in SUPPORTED_DTYPES:
-            raise ValueError(f"Invalid dtype: {self.dtype}")
 
         # Populate the serialized backbone config only when the caller did not provide one.
         if self.vlm_config is None:

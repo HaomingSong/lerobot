@@ -20,7 +20,7 @@ from typing import Any
 import torch
 
 from lerobot.configs.types import FeatureType, PipelineFeatureType, PolicyFeature
-from lerobot.policies.eo1.configuration_eo1 import DEFAULT_VLM_BASE, EO1Config
+from lerobot.policies.eo1.configuration_eo1 import EO1Config
 from lerobot.policies.eo1.qwen2_5_vl.processing_qwen2_5_vl import Qwen2_5_VLProcessor
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
@@ -176,7 +176,7 @@ class EO1ConversationTemplateStep(ComplementaryDataProcessorStep):
 @dataclass
 @ProcessorStepRegistry.register(name="eo1_qwen_processor")
 class EO1QwenProcessorStep(ComplementaryDataProcessorStep):
-    processor_name: str = DEFAULT_VLM_BASE
+    processor_name: str = "Qwen/Qwen2.5-VL-3B-Instruct"
     image_min_pixels: int | None = 64 * 28 * 28
     image_max_pixels: int | None = 128 * 28 * 28
     use_fast_processor: bool = False

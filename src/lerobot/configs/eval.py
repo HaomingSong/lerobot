@@ -40,9 +40,6 @@ class EvalPipelineConfig:
     rename_map: dict[str, str] = field(default_factory=dict)
     # Explicit consent to execute remote code from the Hub (required for hub environments).
     trust_remote_code: bool = False
-    # Apply the EO1 LIBERO gripper remap x -> 2 * (1 - x) - 1 on the last action dimension
-    # right before env.step(). This is disabled by default to avoid changing non-LIBERO evals.
-    libero_gripper_postprocess: bool = False
 
     def __post_init__(self) -> None:
         # HACK: We parse again the cli args here to get the pretrained path if there was one.

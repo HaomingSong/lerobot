@@ -150,13 +150,17 @@ class EO1QwenProcessorStep(ComplementaryDataProcessorStep):
     processor_name: str = "Qwen/Qwen2.5-VL-3B-Instruct"
     image_min_pixels: int | None = 64 * 28 * 28
     image_max_pixels: int | None = 128 * 28 * 28
+    use_fast_processor: bool = False
 
     _processor: Qwen2_5_VLProcessor | None = field(default=None, init=False, repr=False)
     _state_token_id: int | None = field(default=None, init=False, repr=False)
     _action_token_id: int | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
-        self._processor = Qwen2_5_VLProcessor.from_pretrained(self.processor_name)
+        self._processor = Qwen2_5_VLProcessor.from_pretrained(
+            self.processor_name,
+            use_fast=self.use_fast_processor,
+        )
 
         special_tokens = [
             ACTION_START_TOKEN,
@@ -206,6 +210,7 @@ class EO1QwenProcessorStep(ComplementaryDataProcessorStep):
             "processor_name": self.processor_name,
             "image_min_pixels": self.image_min_pixels,
             "image_max_pixels": self.image_max_pixels,
+            "use_fast_processor": self.use_fast_processor,
         }
 
     def transform_features(
@@ -239,6 +244,7 @@ def make_eo1_pre_post_processors(
             processor_name=config.vlm_base,
             image_min_pixels=config.image_min_pixels,
             image_max_pixels=config.image_max_pixels,
+            use_fast_processor=config.use_fast_processor,
         ),
         DeviceProcessorStep(device=config.device),
     ]

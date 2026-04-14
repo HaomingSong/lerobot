@@ -20,7 +20,6 @@ import contextlib
 import logging
 import math
 from collections import deque
-from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -29,7 +28,6 @@ import torch.nn.functional as F  # noqa: N812
 import torch.utils.checkpoint
 from torch import Tensor
 from transformers.activations import ACT2FN
-from transformers.modeling_outputs import ModelOutput
 
 from lerobot.policies.eo1.configuration_eo1 import EO1Config
 from lerobot.policies.pretrained import PreTrainedPolicy
@@ -38,11 +36,6 @@ from lerobot.utils.constants import ACTION, OBS_STATE
 from .qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class EO1FlowMatchingOutput(ModelOutput):
-    fm_loss: torch.FloatTensor | None = None
 
 
 def pad_vector(vector: Tensor, new_dim: int) -> Tensor:
@@ -98,9 +91,7 @@ class EO1Policy(PreTrainedPolicy):
         state = self.prepare_state(batch.get(OBS_STATE))
         actions = self.prepare_action(batch.get(ACTION))
         model_inputs = self._get_model_inputs(batch, {OBS_STATE, ACTION})
-        outputs = self.model(states=state, action=actions, **model_inputs)
-
-        loss = outputs.fm_loss
+        loss = self.model(states=state, action=actions, **model_inputs)
 
         loss_dict = {"loss": loss.item()}
         return loss, loss_dict
@@ -424,7 +415,7 @@ class EO1VisionFlowMatchingModel(nn.Module):
         state_token_id: int = 151669,
         action_token_id: int = 151666,
         **kwargs,
-    ) -> EO1FlowMatchingOutput:
+    ) -> Tensor:
         """Run the EO1 training forward pass and compute the flow-matching loss."""
         inputs_embeds = self.embed_prefix(
             input_ids,
@@ -495,9 +486,7 @@ class EO1VisionFlowMatchingModel(nn.Module):
             v_t = v_t.to(dtype=u_t.dtype)
             fm_loss = F.mse_loss(u_t, v_t, reduction="mean")
 
-        return EO1FlowMatchingOutput(
-            fm_loss=fm_loss,
-        )
+        return fm_loss
 
     @torch.no_grad()
     def sample_actions(

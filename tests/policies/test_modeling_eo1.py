@@ -606,8 +606,13 @@ def test_eo1_padded_actions_follow_standard_diffusion_targets():
     )
 
 
-def test_eo1_flow_loss_keeps_padded_actions_in_reduction():
-    config = make_test_config(dtype="bfloat16")
+def test_eo1_flow_loss_ignores_padded_action_dimensions():
+    config = make_test_config(
+        dtype="bfloat16",
+        output_features={
+            "action": PolicyFeature(type=FeatureType.ACTION, shape=(8,)),
+        },
+    )
     model = EO1VisionFlowMatchingModel(config, DummyVLMBackbone(config.text_config.hidden_size))
 
     class ZeroActionOutProj(nn.Module):
@@ -638,16 +643,18 @@ def test_eo1_flow_loss_keeps_padded_actions_in_reduction():
     )
     model.action_out_proj = ZeroActionOutProj(config.max_action_dim)
 
-    outputs = model(
+    action = torch.zeros(1, config.chunk_size, config.max_action_dim, dtype=torch.float32)
+    action[:, :, : config.output_features["action"].shape[0]] = 1.0
+
+    loss = model(
         input_ids=torch.full((1, config.chunk_size), 7, dtype=torch.long),
         attention_mask=torch.ones(1, config.chunk_size, dtype=torch.long),
-        action=torch.ones(1, config.chunk_size, config.max_action_dim, dtype=torch.float32),
-        action_is_pad=torch.tensor([[False] + [True] * (config.chunk_size - 1)]),
+        action=action,
         action_token_id=7,
     )
 
-    assert outputs.fm_loss is not None
-    assert outputs.fm_loss.item() == pytest.approx(1.0)
+    assert loss is not None
+    assert loss.item() == pytest.approx(1.0)
 
 
 def test_eo1_sample_actions_supports_batched_eval_denoising():

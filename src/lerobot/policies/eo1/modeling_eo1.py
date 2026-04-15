@@ -28,6 +28,8 @@ import torch.nn.functional as F  # noqa: N812
 import torch.utils.checkpoint
 from torch import Tensor
 from transformers.activations import ACT2FN
+
+# HACK: shorter import?
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 
 from lerobot.policies.eo1.configuration_eo1 import EO1Config
@@ -296,6 +298,8 @@ class EO1VisionFlowMatchingModel(nn.Module):
         features = features.to(inputs_embeds.device, inputs_embeds.dtype)
         return inputs_embeds.masked_scatter(feature_mask.to(inputs_embeds.device), features)
 
+    # HACK: could share same func with `scatter_special_token_features`, should follow the implementation of `get_placeholder_mask`
+    # in https://github.com/huggingface/transformers/blob/aad13b87ed59f2afcfaebc985f403301887a35fc/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py#L1232
     def _get_action_token_mask(
         self,
         input_ids: torch.LongTensor,
@@ -344,6 +348,7 @@ class EO1VisionFlowMatchingModel(nn.Module):
                 states = self.maybe_cast_flow_head_input(states, self.state_proj.weight.dtype)
                 return self.state_proj(states)
 
+        # HACK: state is required, remove `if` and `None` in type hint
         state_embs = None
         if states is not None:
             state_embs = self._apply_checkpoint(state_proj_func, states)
@@ -546,6 +551,7 @@ class EO1VisionFlowMatchingModel(nn.Module):
             inputs_embeds[:, act_slice] = action_time_embs.to(inputs_embeds.dtype)
 
             # Keep the prefix KV cache invariant across denoising steps.
+            # HACK: why sey attention_mask=None, should slice with act_end.
             past_key_values.crop(act_start)
             outputs = self.vlm_backbone.model(
                 attention_mask=None,

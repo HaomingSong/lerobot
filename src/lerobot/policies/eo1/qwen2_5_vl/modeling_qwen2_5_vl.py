@@ -815,7 +815,9 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         self._attn_implementation = config._attn_implementation
         self.norm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen2_5_VLRotaryEmbedding(config=config)
-        self.has_sliding_layers = "sliding_attention" in self.config.layer_types and config.sliding_window is not None
+        self.has_sliding_layers = (
+            "sliding_attention" in self.config.layer_types and config.sliding_window is not None
+        )
 
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing

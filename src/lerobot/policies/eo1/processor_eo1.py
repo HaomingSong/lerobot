@@ -45,13 +45,13 @@ from lerobot.utils.constants import (
 SYSTEM_MESSAGE = "You are a helpful physical assistant."
 
 # EO-1 special tokens
-ACTION_START_TOKEN = "<|action_start|>"
-DEFAULT_ACTION_TOKEN = "<|action_pad|>"
-ACTION_END_TOKEN = "<|action_end|>"
-STATE_START_TOKEN = "<|state_start|>"
-DEFAULT_STATE_TOKEN = "<|state_pad|>"
-STATE_END_TOKEN = "<|state_end|>"
-TASK_VLA_TOKEN = "<|vla|>"
+ACTION_START_TOKEN = "<|action_start|>"  # nosec B105
+DEFAULT_ACTION_TOKEN = "<|action_pad|>"  # nosec B105
+ACTION_END_TOKEN = "<|action_end|>"  # nosec B105
+STATE_START_TOKEN = "<|state_start|>"  # nosec B105
+DEFAULT_STATE_TOKEN = "<|state_pad|>"  # nosec B105
+STATE_END_TOKEN = "<|state_end|>"  # nosec B105
+TASK_VLA_TOKEN = "<|vla|>"  # nosec B105
 
 EO1_SPECIAL_TOKENS = [
     ACTION_START_TOKEN,

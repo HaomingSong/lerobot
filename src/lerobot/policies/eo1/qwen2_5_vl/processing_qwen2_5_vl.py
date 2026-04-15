@@ -24,7 +24,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional, Union
 
 import numpy as np
 
@@ -43,15 +42,15 @@ from transformers.video_utils import VideoInput
 
 
 class Qwen2_5_VLVideosProcessorKwargs(VideosKwargs, total=False):
-    fps: Union[list[float], float]
+    fps: list[float] | float
 
 
 class Qwen2_5_VLImagesKwargs(ImagesKwargs):
-    min_pixels: Optional[int]
-    max_pixels: Optional[int]
-    patch_size: Optional[int]
-    temporal_patch_size: Optional[int]
-    merge_size: Optional[int]
+    min_pixels: int | None
+    max_pixels: int | None
+    patch_size: int | None
+    temporal_patch_size: int | None
+    merge_size: int | None
 
 
 class Qwen2_5_VLProcessorKwargs(ProcessingKwargs, total=False):
@@ -87,7 +86,9 @@ class Qwen2_5_VLProcessor(ProcessorMixin):
     video_processor_class = "AutoVideoProcessor"
     tokenizer_class = ("Qwen2Tokenizer", "Qwen2TokenizerFast")
 
-    def __init__(self, image_processor=None, tokenizer=None, video_processor=None, chat_template=None, **kwargs):
+    def __init__(
+        self, image_processor=None, tokenizer=None, video_processor=None, chat_template=None, **kwargs
+    ):
         self.image_token = "<|image_pad|>" if not hasattr(tokenizer, "image_token") else tokenizer.image_token
         self.video_token = "<|video_pad|>" if not hasattr(tokenizer, "video_token") else tokenizer.video_token
         self.image_token_id = (
@@ -105,7 +106,7 @@ class Qwen2_5_VLProcessor(ProcessorMixin):
     def __call__(
         self,
         images: ImageInput = None,
-        text: Union[TextInput, PreTokenizedInput, list[TextInput], list[PreTokenizedInput]] = None,
+        text: TextInput | PreTokenizedInput | list[TextInput] | list[PreTokenizedInput] = None,
         videos: VideoInput = None,
         **kwargs: Unpack[Qwen2_5_VLProcessorKwargs],
     ) -> BatchFeature:

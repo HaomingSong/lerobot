@@ -29,6 +29,9 @@ from .qwen2_5_vl.configuration_qwen2_5_vl import (
     Qwen2_5_VLVisionConfig,
 )
 
+if not hasattr(Qwen2_5_VLTextConfig, "pad_token_id"):
+    Qwen2_5_VLTextConfig.pad_token_id = None
+
 
 @PreTrainedConfig.register_subclass("eo1")
 @dataclass

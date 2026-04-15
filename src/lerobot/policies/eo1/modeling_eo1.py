@@ -38,7 +38,7 @@ from .qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 logger = logging.getLogger(__name__)
 
 
-def pad_vector(vector: Tensor, new_dim: int) -> Tensor:
+def pad_vector(vector, new_dim):
     """Pad the last dimension of a vector to new_dim with zeros.
 
     Can be (batch_size x sequence_length x features_dimension)
@@ -131,12 +131,21 @@ class EO1Policy(PreTrainedPolicy):
         return self.parameters()
 
 
-def create_sinusoidal_pos_embedding(
-    time: Tensor,
-    dimension: int,
-    min_period: float,
-    max_period: float,
-    device: torch.device | str = "cpu",
+def get_safe_dtype(target_dtype, device_type):
+    """Get a safe dtype for the given device type."""
+    if device_type == "mps" and target_dtype == torch.float64:
+        return torch.float32
+    if device_type == "cpu":
+        # CPU doesn't support bfloat16, use float32 instead
+        if target_dtype == torch.bfloat16:
+            return torch.float32
+        if target_dtype == torch.float64:
+            return torch.float64
+    return target_dtype
+
+
+def create_sinusoidal_pos_embedding(  # see openpi `create_sinusoidal_pos_embedding` (exact copy)
+    time: torch.Tensor, dimension: int, min_period: float, max_period: float, device="cpu"
 ) -> Tensor:
     """Computes sine-cosine positional embedding vectors for scalar positions."""
     if dimension % 2 != 0:
@@ -145,13 +154,22 @@ def create_sinusoidal_pos_embedding(
     if time.ndim != 1:
         raise ValueError("The time tensor is expected to be of shape `(batch_size, )`.")
 
-    fraction = torch.linspace(0.0, 1.0, dimension // 2, device=device)
+    dtype = get_safe_dtype(torch.float64, device.type)
+    fraction = torch.linspace(0.0, 1.0, dimension // 2, dtype=dtype, device=device)
     period = min_period * (max_period / min_period) ** fraction
 
+    # Compute the outer product
     scaling_factor = 1.0 / period * 2 * math.pi
     sin_input = scaling_factor[None, :] * time[:, None]
-    pos_emb = torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1)
-    return pos_emb
+    return torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1)
+
+
+def sample_beta(alpha, beta, bsize, device):  # see openpi `sample_beta` (exact copy)
+    # Beta sampling uses _sample_dirichlet which isn't implemented for MPS, so sample on CPU
+    alpha_t = torch.tensor(alpha, dtype=torch.float32)
+    beta_t = torch.tensor(beta, dtype=torch.float32)
+    dist = torch.distributions.Beta(alpha_t, beta_t)
+    return dist.sample((bsize,)).to(device)
 
 
 class EO1VisionActionProjector(torch.nn.Sequential):
@@ -258,13 +276,11 @@ class EO1VisionFlowMatchingModel(nn.Module):
         return noise
 
     def sample_time(self, bsize, device):
-        beta_dist = torch.distributions.Beta(
-            concentration1=self.config.time_sampling_beta_alpha,
-            concentration0=self.config.time_sampling_beta_beta,
+        time_beta = sample_beta(
+            self.config.time_sampling_beta_alpha, self.config.time_sampling_beta_beta, bsize, device
         )
-        time_beta = beta_dist.sample((bsize,)).to(device=device, dtype=torch.float32)
         time = time_beta * self.config.time_sampling_scale + self.config.time_sampling_offset
-        return time
+        return time.to(dtype=torch.float32, device=device)
 
     def scatter_special_token_features(
         self,
@@ -272,18 +288,15 @@ class EO1VisionFlowMatchingModel(nn.Module):
         inputs_embeds: torch.FloatTensor,
         token_id: int | None,
         features: torch.FloatTensor | None,
-        feature_name: str,
     ) -> torch.FloatTensor:
         if features is None or token_id is None:
             return inputs_embeds
 
         num_tokens = int((input_ids == token_id).sum().item())
         num_features = features.shape[0]
-        if num_tokens != num_features:
-            raise ValueError(
-                f"{feature_name} features do not match token count: tokens={num_tokens}, features={num_features}."
-            )
-
+        assert num_tokens == num_features, (
+            f"Features do not match token count: tokens={num_tokens}, features={num_features}."
+        )
         feature_mask = (input_ids == token_id).unsqueeze(-1).expand_as(inputs_embeds)
         features = features.to(inputs_embeds.device, inputs_embeds.dtype)
         return inputs_embeds.masked_scatter(feature_mask.to(inputs_embeds.device), features)
@@ -362,7 +375,6 @@ class EO1VisionFlowMatchingModel(nn.Module):
                 inputs_embeds,
                 state_token_id,
                 state_embs,
-                feature_name="State",
             )
         return inputs_embeds
 

@@ -227,7 +227,6 @@ class EO1QwenProcessorStep(ComplementaryDataProcessorStep):
 def make_eo1_pre_post_processors(
     config: EO1Config,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
-    rename_map: dict[str, str] | None = None,
 ) -> tuple[
     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     PolicyProcessorPipeline[PolicyAction, PolicyAction],
@@ -235,7 +234,7 @@ def make_eo1_pre_post_processors(
     """Build pre/post processor pipelines for EO1."""
 
     input_steps: list[ProcessorStep] = [
-        RenameObservationsProcessorStep(rename_map=rename_map or {}),
+        RenameObservationsProcessorStep(rename_map={}),
         AddBatchDimensionProcessorStep(),
         NormalizerProcessorStep(
             features={**config.input_features, **config.output_features},

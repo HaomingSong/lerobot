@@ -21,7 +21,6 @@ import torch
 from lerobot.configs.types import FeatureType, PipelineFeatureType, PolicyFeature
 from lerobot.policies.eo1 import processor_eo1 as processor_module
 from lerobot.policies.eo1.configuration_eo1 import EO1Config
-from lerobot.policies.factory import make_pre_post_processors
 from lerobot.processor.converters import create_transition
 
 
@@ -190,23 +189,3 @@ def test_make_eo1_pre_post_processors_keeps_visual_feature_shapes(monkeypatch):
         "processor_name": "dummy",
         "use_fast": False,
     }
-
-
-def test_make_pre_post_processors_passes_rename_map_to_eo1(monkeypatch):
-    monkeypatch.setattr(processor_module, "Qwen2_5_VLProcessor", FakeQwenProcessorFactory)
-    config = EO1Config(
-        vlm_base="dummy",
-        vlm_config={},
-        device="cpu",
-        input_features=build_input_features(),
-        output_features=build_output_features(),
-    )
-
-    preprocessor, _ = make_pre_post_processors(
-        policy_cfg=config,
-        rename_map={"observation.rgb": "observation.image"},
-    )
-
-    rename_step = preprocessor.steps[0]
-    assert isinstance(rename_step, processor_module.RenameObservationsProcessorStep)
-    assert rename_step.rename_map == {"observation.rgb": "observation.image"}

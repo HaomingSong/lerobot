@@ -542,7 +542,6 @@ def eval_main(cfg: EvalPipelineConfig):
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg.policy,
         pretrained_path=cfg.policy.pretrained_path,
-        rename_map=cfg.rename_map,
         preprocessor_overrides=preprocessor_overrides,
     )
 

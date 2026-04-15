@@ -446,8 +446,6 @@ def test_eo1_prepare_helpers_pad_without_mutating_batch_contract():
 
     assert padded_state.shape == (2, 6)
     assert padded_action.shape == (2, 3, 8)
-    assert EO1Policy.prepare_state(policy, None) is None
-    assert EO1Policy.prepare_action(policy, None) is None
 
 
 def test_eo1_embed_suffix_stays_fp32_inside_global_autocast():

@@ -88,8 +88,8 @@ class EO1Policy(PreTrainedPolicy):
         return {key: value for key, value in batch.items() if key not in excluded_keys}
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
-        state = self.prepare_state(batch.get(OBS_STATE))
-        actions = self.prepare_action(batch.get(ACTION))
+        state = self.prepare_state(batch[OBS_STATE])
+        actions = self.prepare_action(batch[ACTION])
         model_inputs = self._get_model_inputs(batch, {OBS_STATE, ACTION})
         loss = self.model(states=state, action=actions, **model_inputs)
 
@@ -100,21 +100,17 @@ class EO1Policy(PreTrainedPolicy):
     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs) -> Tensor:
         self.eval()
 
-        states = self.prepare_state(batch.get(OBS_STATE))
+        states = self.prepare_state(batch[OBS_STATE])
         model_inputs = self._get_model_inputs(batch, {OBS_STATE})
         actions = self.model.sample_actions(states=states, **model_inputs).to(torch.float32)
 
         original_action_dim = self.config.output_features[ACTION].shape[0]
         return actions[:, :, :original_action_dim]
 
-    def prepare_state(self, state: Tensor | None) -> Tensor | None:
-        if state is None:
-            return None
+    def prepare_state(self, state: Tensor) -> Tensor:
         return pad_vector(state, self.config.max_state_dim)
 
-    def prepare_action(self, action: Tensor | None) -> Tensor | None:
-        if action is None:
-            return None
+    def prepare_action(self, action: Tensor) -> Tensor:
         return pad_vector(action, self.config.max_action_dim)
 
     @torch.no_grad()
@@ -332,50 +328,47 @@ class EO1VisionFlowMatchingModel(nn.Module):
     def embed_prefix(
         self,
         input_ids: torch.LongTensor,
-        inputs_embeds: torch.FloatTensor | None = None,
         pixel_values: torch.Tensor | None = None,
         image_grid_thw: torch.LongTensor | None = None,
         states: torch.Tensor | None = None,
         state_token_id: int | None = None,
     ) -> torch.FloatTensor:
         """Embed the multimodal prefix consumed by the Qwen backbone."""
-        if inputs_embeds is None:
 
-            def input_embed_func(input_ids: torch.LongTensor) -> torch.FloatTensor:
-                return self.get_input_embeddings()(input_ids)
+        # Get the input embeddings for the input IDs
+        def input_embed_func(input_ids: torch.LongTensor) -> torch.FloatTensor:
+            return self.get_input_embeddings()(input_ids)
 
-            inputs_embeds = self._apply_checkpoint(input_embed_func, input_ids)
+        inputs_embeds = self._apply_checkpoint(input_embed_func, input_ids)
 
-        if pixel_values is not None:
+        # Get the image embeddings
+        def image_embed_func(
+            pixel_values: torch.Tensor,
+            image_grid_thw: torch.LongTensor | None,
+        ) -> torch.FloatTensor:
+            image_embeds = self.vlm_backbone.get_image_features(pixel_values, image_grid_thw)
+            return torch.cat(image_embeds, dim=0)
 
-            def image_embed_func(
-                pixel_values: torch.Tensor,
-                image_grid_thw: torch.LongTensor | None,
-            ) -> torch.FloatTensor:
-                image_embeds = self.vlm_backbone.get_image_features(pixel_values, image_grid_thw)
-                return torch.cat(image_embeds, dim=0)
+        image_embeds = self._apply_checkpoint(image_embed_func, pixel_values, image_grid_thw)
+        image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+        image_mask, _ = self.vlm_backbone.get_placeholder_mask(
+            input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
+        )
+        inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
-            image_embeds = self._apply_checkpoint(image_embed_func, pixel_values, image_grid_thw)
-            image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
-            image_mask, _ = self.vlm_backbone.get_placeholder_mask(
-                input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
-            )
-            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+        # Project the states to the hidden size
+        def state_proj_func(states: torch.Tensor) -> torch.FloatTensor:
+            with self.flow_head_autocast_context():
+                states = self.maybe_cast_flow_head_input(states, self.state_proj.weight.dtype)
+                return self.state_proj(states)
 
-        if states is not None:
-
-            def state_proj_func(states: torch.Tensor) -> torch.FloatTensor:
-                with self.flow_head_autocast_context():
-                    states = self.maybe_cast_flow_head_input(states, self.state_proj.weight.dtype)
-                    return self.state_proj(states)
-
-            state_embs = self._apply_checkpoint(state_proj_func, states)
-            inputs_embeds = self.scatter_special_token_features(
-                input_ids,
-                inputs_embeds,
-                state_token_id,
-                state_embs,
-            )
+        state_embs = self._apply_checkpoint(state_proj_func, states)
+        inputs_embeds = self.scatter_special_token_features(
+            input_ids,
+            inputs_embeds,
+            state_token_id,
+            state_embs,
+        )
         return inputs_embeds
 
     def embed_suffix(
@@ -437,22 +430,21 @@ class EO1VisionFlowMatchingModel(nn.Module):
             state_token_id=state_token_id,
         )
 
-        action_mask = None
-        if action is not None:
-            time = self.sample_time(action.shape[0], inputs_embeds.device)
-            noise = self.sample_noise(action.shape, inputs_embeds.device)
-            time_expanded = time[:, None, None]
-            x_t = time_expanded * noise + (1 - time_expanded) * action
-            u_t = noise - action
-            action_time_embs = self.embed_suffix(time, x_t)
-            action_token_mask = self._get_action_token_mask(input_ids, action_token_id)
-            action_mask = action_token_mask.unsqueeze(-1).expand_as(inputs_embeds)
-            action_mask = action_mask.to(inputs_embeds.device)
-            action_time_embs = action_time_embs.to(inputs_embeds.device, inputs_embeds.dtype)
-            inputs_embeds = inputs_embeds.masked_scatter(action_mask, action_time_embs)
+        # Scatter the action tokens into the inputs embeddings
+        time = self.sample_time(action.shape[0], inputs_embeds.device)
+        noise = self.sample_noise(action.shape, inputs_embeds.device)
+        time_expanded = time[:, None, None]
+        x_t = time_expanded * noise + (1 - time_expanded) * action
+        u_t = noise - action
+        action_time_embs = self.embed_suffix(time, x_t)
+        action_token_mask = self._get_action_token_mask(input_ids, action_token_id)
+        action_mask = action_token_mask.unsqueeze(-1).expand_as(inputs_embeds)
+        action_mask = action_mask.to(inputs_embeds.device)
+        action_time_embs = action_time_embs.to(inputs_embeds.device, inputs_embeds.dtype)
+        inputs_embeds = inputs_embeds.masked_scatter(action_mask, action_time_embs)
 
-        if attention_mask is not None:
-            attention_mask = attention_mask.to(inputs_embeds.device)
+        # Cast the attention mask to the device of the inputs embeddings
+        attention_mask = attention_mask.to(inputs_embeds.device)
 
         # Training only needs the final hidden states for the action tokens.
         # Avoid the CausalLM wrapper here so we do not materialize lm_head logits,
@@ -479,26 +471,22 @@ class EO1VisionFlowMatchingModel(nn.Module):
             return outputs.last_hidden_state
 
         hidden_states = self._apply_checkpoint(vlm_forward_func, position_ids, attention_mask, inputs_embeds)
+        action_hidden_states = hidden_states[action_mask[..., 0]]
 
-        fm_loss = None
-        if action is not None:
-            if action_mask is None:
-                raise ValueError("Action mask must be defined when action targets are provided.")
-            action_hidden_states = hidden_states[action_mask[..., 0]]
+        # compute the flow-matching loss
+        def action_out_proj_func(action_hidden_states: torch.FloatTensor) -> torch.FloatTensor:
+            with self.flow_head_autocast_context():
+                action_hidden_states = self.maybe_cast_flow_head_input(
+                    action_hidden_states, self.action_out_proj.dtype
+                )
+                return self.action_out_proj(action_hidden_states)
 
-            def action_out_proj_func(action_hidden_states: torch.FloatTensor) -> torch.FloatTensor:
-                with self.flow_head_autocast_context():
-                    action_hidden_states = self.maybe_cast_flow_head_input(
-                        action_hidden_states, self.action_out_proj.dtype
-                    )
-                    return self.action_out_proj(action_hidden_states)
-
-            v_t = self._apply_checkpoint(action_out_proj_func, action_hidden_states)
-            u_t = u_t.reshape(v_t.shape)
-            original_action_dim = self.config.output_features[ACTION].shape[0]
-            u_t = u_t[:, :original_action_dim]
-            v_t = v_t[:, :original_action_dim].to(dtype=u_t.dtype)
-            fm_loss = F.mse_loss(u_t, v_t, reduction="mean")
+        v_t = self._apply_checkpoint(action_out_proj_func, action_hidden_states)
+        u_t = u_t.reshape(v_t.shape)
+        original_action_dim = self.config.output_features[ACTION].shape[0]
+        u_t = u_t[:, :original_action_dim]
+        v_t = v_t[:, :original_action_dim].to(dtype=u_t.dtype)
+        fm_loss = F.mse_loss(u_t, v_t, reduction="mean")
 
         return fm_loss
 

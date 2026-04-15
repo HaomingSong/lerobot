@@ -18,10 +18,10 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import torch
+from transformers.models.qwen2_5_vl.processing_qwen2_5_vl import Qwen2_5_VLProcessor
 
 from lerobot.configs.types import FeatureType, PipelineFeatureType, PolicyFeature
 from lerobot.policies.eo1.configuration_eo1 import EO1Config
-from lerobot.policies.eo1.qwen2_5_vl.processing_qwen2_5_vl import Qwen2_5_VLProcessor
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     ComplementaryDataProcessorStep,
@@ -200,8 +200,8 @@ class EO1QwenProcessorStep(ComplementaryDataProcessorStep):
         complementary_data["input_ids"] = inputs["input_ids"]
         complementary_data["pixel_values"] = inputs["pixel_values"]
         complementary_data["image_grid_thw"] = inputs["image_grid_thw"]
-
         complementary_data["attention_mask"] = inputs["attention_mask"]
+        complementary_data["mm_token_type_ids"] = inputs["mm_token_type_ids"]
         complementary_data["state_token_id"] = self._state_token_id
         complementary_data["action_token_id"] = self._action_token_id
 

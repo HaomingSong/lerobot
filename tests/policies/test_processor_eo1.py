@@ -63,6 +63,7 @@ class FakeQwenProcessor:
             "pixel_values": torch.ones(1, 3, 2, 2, dtype=torch.float32),
             "image_grid_thw": torch.ones(1, 3, dtype=torch.long),
             "attention_mask": torch.ones(1, 4, dtype=torch.long),
+            "mm_token_type_ids": torch.zeros(1, 4, dtype=torch.int),
         }
 
 
@@ -136,6 +137,11 @@ def test_eo1_qwen_processor_uses_right_padding_for_supervised_batches(monkeypatc
     assert "do_resize" not in kwargs
     assert output[processor_module.TransitionKey.COMPLEMENTARY_DATA]["state_token_id"] == 11
     assert output[processor_module.TransitionKey.COMPLEMENTARY_DATA]["action_token_id"] == 12
+    assert "mm_token_type_ids" in output[processor_module.TransitionKey.COMPLEMENTARY_DATA]
+    torch.testing.assert_close(
+        output[processor_module.TransitionKey.COMPLEMENTARY_DATA]["mm_token_type_ids"],
+        torch.zeros(1, 4, dtype=torch.int),
+    )
 
 
 def test_eo1_qwen_processor_uses_left_padding_for_rollout_batches(monkeypatch):

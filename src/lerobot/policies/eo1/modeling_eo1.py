@@ -28,12 +28,11 @@ import torch.nn.functional as F  # noqa: N812
 import torch.utils.checkpoint
 from torch import Tensor
 from transformers.activations import ACT2FN
+from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 
 from lerobot.policies.eo1.configuration_eo1 import EO1Config
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_STATE
-
-from .qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 
 logger = logging.getLogger(__name__)
 
@@ -328,12 +327,10 @@ class EO1VisionFlowMatchingModel(nn.Module):
     def embed_prefix(
         self,
         input_ids: torch.LongTensor,
-        pixel_values: torch.Tensor | None = None,
-        image_grid_thw: torch.LongTensor | None = None,
         states: torch.Tensor | None = None,
         state_token_id: int | None = None,
     ) -> torch.FloatTensor:
-        """Embed the multimodal prefix consumed by the Qwen backbone."""
+        """Embed the EO1 prefix tokens before native Qwen injects multimodal features."""
 
         # Get the input embeddings for the input IDs
         def input_embed_func(input_ids: torch.LongTensor) -> torch.FloatTensor:
@@ -341,28 +338,15 @@ class EO1VisionFlowMatchingModel(nn.Module):
 
         inputs_embeds = self._apply_checkpoint(input_embed_func, input_ids)
 
-        # Get the image embeddings
-        def image_embed_func(
-            pixel_values: torch.Tensor,
-            image_grid_thw: torch.LongTensor | None,
-        ) -> torch.FloatTensor:
-            image_embeds = self.vlm_backbone.get_image_features(pixel_values, image_grid_thw)
-            return torch.cat(image_embeds, dim=0)
-
-        image_embeds = self._apply_checkpoint(image_embed_func, pixel_values, image_grid_thw)
-        image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
-        image_mask, _ = self.vlm_backbone.get_placeholder_mask(
-            input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
-        )
-        inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
-
         # Project the states to the hidden size
         def state_proj_func(states: torch.Tensor) -> torch.FloatTensor:
             with self.flow_head_autocast_context():
                 states = self.maybe_cast_flow_head_input(states, self.state_proj.weight.dtype)
                 return self.state_proj(states)
 
-        state_embs = self._apply_checkpoint(state_proj_func, states)
+        state_embs = None
+        if states is not None:
+            state_embs = self._apply_checkpoint(state_proj_func, states)
         inputs_embeds = self.scatter_special_token_features(
             input_ids,
             inputs_embeds,
@@ -415,6 +399,7 @@ class EO1VisionFlowMatchingModel(nn.Module):
         attention_mask: torch.Tensor | None = None,
         pixel_values: torch.Tensor | None = None,
         image_grid_thw: torch.LongTensor | None = None,
+        mm_token_type_ids: torch.IntTensor | None = None,
         states: torch.Tensor | None = None,
         action: torch.Tensor | None = None,
         state_token_id: int = 151669,
@@ -424,8 +409,6 @@ class EO1VisionFlowMatchingModel(nn.Module):
         """Run the EO1 training forward pass and compute the flow-matching loss."""
         inputs_embeds = self.embed_prefix(
             input_ids,
-            pixel_values=pixel_values,
-            image_grid_thw=image_grid_thw,
             states=states,
             state_token_id=state_token_id,
         )
@@ -446,31 +429,37 @@ class EO1VisionFlowMatchingModel(nn.Module):
         # Cast the attention mask to the device of the inputs embeddings
         attention_mask = attention_mask.to(inputs_embeds.device)
 
-        # Training only needs the final hidden states for the action tokens.
-        # Avoid the CausalLM wrapper here so we do not materialize lm_head logits,
-        # full-layer hidden states, or KV cache during every train step.
-        position_ids, _ = self.vlm_backbone.get_rope_index(
-            input_ids,
-            image_grid_thw=image_grid_thw,
-            attention_mask=attention_mask,
-        )
-
         def vlm_forward_func(
-            position_ids: torch.LongTensor,
+            input_ids: torch.LongTensor,
             attention_mask: torch.Tensor | None,
             inputs_embeds: torch.FloatTensor,
+            pixel_values: torch.Tensor | None,
+            image_grid_thw: torch.LongTensor | None,
+            mm_token_type_ids: torch.IntTensor | None,
         ) -> torch.FloatTensor:
             outputs = self.vlm_backbone.model(
-                position_ids=position_ids,
+                input_ids=input_ids,
                 attention_mask=attention_mask,
                 inputs_embeds=inputs_embeds,
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+                mm_token_type_ids=mm_token_type_ids,
+                position_ids=None,
                 use_cache=False,
                 output_hidden_states=False,
                 return_dict=True,
             )
             return outputs.last_hidden_state
 
-        hidden_states = self._apply_checkpoint(vlm_forward_func, position_ids, attention_mask, inputs_embeds)
+        hidden_states = self._apply_checkpoint(
+            vlm_forward_func,
+            input_ids,
+            attention_mask,
+            inputs_embeds,
+            pixel_values,
+            image_grid_thw,
+            mm_token_type_ids,
+        )
         action_hidden_states = hidden_states[action_mask[..., 0]]
 
         # compute the flow-matching loss
@@ -497,6 +486,7 @@ class EO1VisionFlowMatchingModel(nn.Module):
         attention_mask: torch.Tensor | None = None,
         pixel_values: torch.Tensor | None = None,
         image_grid_thw: torch.LongTensor | None = None,
+        mm_token_type_ids: torch.IntTensor | None = None,
         states: torch.Tensor | None = None,
         state_token_id: int = 151669,
         action_token_id: int = 151666,
@@ -512,17 +502,9 @@ class EO1VisionFlowMatchingModel(nn.Module):
         )
         act_slice = self._infer_action_slice(action_mask)
         act_start = act_slice.start
-        act_end = act_slice.stop
 
-        position_ids, _ = self.vlm_backbone.get_rope_index(
-            input_ids,
-            image_grid_thw=image_grid_thw,
-            attention_mask=attention_mask,
-        )
         inputs_embeds = self.embed_prefix(
             input_ids,
-            pixel_values=pixel_values,
-            image_grid_thw=image_grid_thw,
             states=states,
             state_token_id=state_token_id,
         ).clone()
@@ -530,13 +512,20 @@ class EO1VisionFlowMatchingModel(nn.Module):
         batch_size = input_ids.shape[0]
         device = inputs_embeds.device
         attention_mask = attention_mask.to(device)
-        position_ids = position_ids.to(device)
+        prefix_mm_token_type_ids = None
+        if mm_token_type_ids is not None:
+            prefix_mm_token_type_ids = mm_token_type_ids[:, :act_start].to(device)
 
         outputs = self.vlm_backbone.model(
-            position_ids=position_ids[..., :act_start],
+            input_ids=input_ids[:, :act_start],
             attention_mask=attention_mask[:, :act_start],
             inputs_embeds=inputs_embeds[:, :act_start],
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            mm_token_type_ids=prefix_mm_token_type_ids,
+            position_ids=None,
             use_cache=True,
+            return_dict=True,
         )
 
         x_t = self.sample_noise(
@@ -559,11 +548,12 @@ class EO1VisionFlowMatchingModel(nn.Module):
             # Keep the prefix KV cache invariant across denoising steps.
             past_key_values.crop(act_start)
             outputs = self.vlm_backbone.model(
-                position_ids=position_ids[..., act_slice],
-                attention_mask=attention_mask[:, :act_end],
+                attention_mask=None,
                 past_key_values=past_key_values,
                 inputs_embeds=inputs_embeds[:, act_slice],
+                position_ids=None,
                 use_cache=True,
+                return_dict=True,
             )
             with self.flow_head_autocast_context():
                 hidden_states = outputs.last_hidden_state[:, :chunk_size]

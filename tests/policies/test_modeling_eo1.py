@@ -29,6 +29,7 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.policies.eo1.configuration_eo1 import EO1Config
 from lerobot.policies.eo1.modeling_eo1 import EO1Policy, EO1VisionFlowMatchingModel
+from lerobot.utils.constants import ACTION
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_QWEN_ROOT = WORKSPACE_ROOT / "eo1_artifacts" / "Qwen2.5-VL-3B-Instruct"
@@ -62,73 +63,32 @@ class DummyVLMBackbone(nn.Module):
         self.gradient_checkpointing = False
         self.gradient_checkpointing_disable_calls += 1
 
-    def get_rope_index(
-        self,
-        input_ids: torch.Tensor,
-        image_grid_thw: torch.Tensor | None = None,
-        attention_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, None]:
-        batch_size, seq_len = input_ids.shape
-        position_ids = torch.arange(seq_len, device=input_ids.device).view(1, 1, -1).expand(3, batch_size, -1)
-        return position_ids, None
-
-    def get_image_features(
-        self,
-        pixel_values: torch.Tensor,
-        image_grid_thw: torch.Tensor | None = None,
-    ) -> list[torch.Tensor]:
-        self.image_feature_calls.append({"pixel_values": pixel_values, "image_grid_thw": image_grid_thw})
-        batch_size = pixel_values.shape[0]
-        hidden_size = self.embedding.embedding_dim
-        return [
-            torch.ones(1, hidden_size, dtype=self.embedding.weight.dtype, device=pixel_values.device)
-        ] * batch_size
-
-    def get_video_features(
-        self,
-        pixel_values_videos: torch.Tensor,
-        video_grid_thw: torch.Tensor | None = None,
-    ) -> list[torch.Tensor]:
-        self.video_feature_calls.append(
-            {"pixel_values_videos": pixel_values_videos, "video_grid_thw": video_grid_thw}
-        )
-        batch_size = pixel_values_videos.shape[0]
-        hidden_size = self.embedding.embedding_dim
-        return [
-            torch.ones(1, hidden_size, dtype=self.embedding.weight.dtype, device=pixel_values_videos.device)
-        ] * batch_size
-
-    def get_placeholder_mask(
-        self,
-        input_ids: torch.LongTensor,
-        inputs_embeds: torch.FloatTensor,
-        image_features: torch.FloatTensor = None,
-        video_features: torch.FloatTensor = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        image_mask = torch.zeros_like(inputs_embeds, dtype=torch.bool)
-        video_mask = torch.zeros_like(inputs_embeds, dtype=torch.bool)
-        if image_features is not None:
-            image_mask[:, 0, :] = True
-        if video_features is not None:
-            video_mask[:, 0, :] = True
-        return image_mask, video_mask
-
     def model(
         self,
         *,
+        input_ids: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        pixel_values: torch.Tensor | None = None,
+        image_grid_thw: torch.Tensor | None = None,
+        mm_token_type_ids: torch.Tensor | None = None,
         use_cache: bool | None = None,
         output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
         **kwargs,
     ):
+        if inputs_embeds is None:
+            inputs_embeds = self.embedding(input_ids)
         self.model_calls.append(
             {
+                "input_ids": input_ids,
                 "position_ids": position_ids,
                 "attention_mask": attention_mask,
                 "inputs_embeds": inputs_embeds,
+                "pixel_values": pixel_values,
+                "image_grid_thw": image_grid_thw,
+                "mm_token_type_ids": mm_token_type_ids,
                 "use_cache": use_cache,
                 "output_hidden_states": output_hidden_states,
                 "return_dict": return_dict,
@@ -168,6 +128,12 @@ def make_test_config(**overrides) -> EO1Config:
     qwen_root = Path(DEFAULT_QWEN_ROOT)
     if not qwen_root.exists():
         pytest.skip(f"EO1 Qwen checkpoint not found: {qwen_root}")
+    overrides.setdefault(
+        "output_features",
+        {
+            ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(32,)),
+        },
+    )
     return EO1Config(vlm_base=str(qwen_root), **overrides)
 
 
@@ -487,15 +453,15 @@ def test_eo1_forward_loss_stays_fp32_inside_global_autocast():
     action = torch.randn(1, config.chunk_size, config.max_action_dim, dtype=torch.float32)
 
     with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
-        outputs = model(
+        loss = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             action=action,
             action_token_id=action_token_id,
         )
 
-    assert outputs.fm_loss is not None
-    assert outputs.fm_loss.dtype == torch.float32
+    assert loss is not None
+    assert loss.dtype == torch.float32
 
 
 def test_eo1_forward_uses_manual_checkpointing(monkeypatch):
@@ -516,19 +482,21 @@ def test_eo1_forward_uses_manual_checkpointing(monkeypatch):
         dim=1,
     )
     attention_mask = torch.ones_like(input_ids)
+    mm_token_type_ids = torch.zeros_like(input_ids, dtype=torch.int)
     states = torch.randn(batch_size, config.max_state_dim, dtype=torch.float32)
     action = torch.randn(batch_size, config.chunk_size, config.max_action_dim, dtype=torch.float32)
 
-    outputs = model(
+    loss = model(
         input_ids=input_ids,
         attention_mask=attention_mask,
+        mm_token_type_ids=mm_token_type_ids,
         states=states,
         action=action,
         state_token_id=state_token_id,
         action_token_id=action_token_id,
     )
 
-    assert outputs.fm_loss is not None
+    assert loss is not None
     assert calls == [
         "input_embed_func",
         "state_proj_func",
@@ -537,9 +505,12 @@ def test_eo1_forward_uses_manual_checkpointing(monkeypatch):
         "vlm_forward_func",
         "action_out_proj_func",
     ]
+    model_call = model.vlm_backbone.model_calls[-1]
+    assert model_call["position_ids"] is None
+    torch.testing.assert_close(model_call["mm_token_type_ids"], mm_token_type_ids)
 
 
-def test_eo1_embed_prefix_visual_branch_uses_manual_checkpointing(monkeypatch):
+def test_eo1_embed_prefix_uses_manual_checkpointing(monkeypatch):
     config = make_test_config(dtype="bfloat16")
     backbone = DummyVLMBackbone(config.text_config.hidden_size)
     model = EO1VisionFlowMatchingModel(config, backbone)
@@ -548,18 +519,16 @@ def test_eo1_embed_prefix_visual_branch_uses_manual_checkpointing(monkeypatch):
     model.train()
 
     input_ids = torch.tensor([[11, 12, 13]], dtype=torch.long)
-    pixel_values = torch.randn(1, 3, 2, 2, dtype=torch.float32)
-    image_grid_thw = torch.tensor([[1, 1, 1]], dtype=torch.long)
+    states = torch.randn(1, config.max_state_dim, dtype=torch.float32)
 
     inputs_embeds = model.embed_prefix(
         input_ids=input_ids,
-        pixel_values=pixel_values,
-        image_grid_thw=image_grid_thw,
+        states=states,
+        state_token_id=11,
     )
 
     assert inputs_embeds.shape == (1, input_ids.shape[1], config.text_config.hidden_size)
-    assert backbone.image_feature_calls
-    assert calls == ["input_embed_func", "image_embed_func"]
+    assert calls == ["input_embed_func", "state_proj_func"]
 
 
 def test_eo1_padded_actions_follow_standard_diffusion_targets():
@@ -589,7 +558,7 @@ def test_eo1_padded_actions_follow_standard_diffusion_targets():
     model.embed_suffix = fake_embed_suffix
     action_token_id = 7
 
-    outputs = model(
+    loss = model(
         input_ids=torch.full((1, config.chunk_size), action_token_id, dtype=torch.long),
         attention_mask=torch.ones(1, config.chunk_size, dtype=torch.long),
         action=action,
@@ -597,7 +566,7 @@ def test_eo1_padded_actions_follow_standard_diffusion_targets():
         action_token_id=action_token_id,
     )
 
-    assert outputs.fm_loss is not None
+    assert loss is not None
     assert torch.allclose(
         captured["noisy_actions"],
         torch.full((1, config.chunk_size, config.max_action_dim), 2.0, dtype=torch.float32),
@@ -680,11 +649,13 @@ def test_eo1_sample_actions_supports_batched_eval_denoising():
         dim=1,
     )
     attention_mask = torch.ones_like(input_ids)
+    mm_token_type_ids = torch.zeros_like(input_ids, dtype=torch.int)
     states = torch.randn(batch_size, config.max_state_dim, dtype=torch.float32)
 
     actions = model.sample_actions(
         input_ids=input_ids,
         attention_mask=attention_mask,
+        mm_token_type_ids=mm_token_type_ids,
         states=states,
         state_token_id=state_token_id,
         action_token_id=action_token_id,
@@ -701,6 +672,9 @@ def test_eo1_sample_actions_supports_batched_eval_denoising():
             timestep,
             torch.full((batch_size,), expected, dtype=torch.float32),
         )
+    prefill = model.vlm_backbone.model_calls[0]
+    assert prefill["position_ids"] is None
+    torch.testing.assert_close(prefill["mm_token_type_ids"], mm_token_type_ids[:, :1])
 
 
 def test_eo1_sample_actions_crops_cache_back_to_prefix_each_step(monkeypatch):
@@ -724,6 +698,7 @@ def test_eo1_sample_actions_crops_cache_back_to_prefix_each_step(monkeypatch):
 
     def fake_model(
         *,
+        input_ids: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
@@ -752,11 +727,13 @@ def test_eo1_sample_actions_crops_cache_back_to_prefix_each_step(monkeypatch):
         [[0, 0, state_token_id, 21, action_token_id, action_token_id, action_token_id, action_token_id]]
     )
     attention_mask = torch.tensor([[0, 0, 1, 1, 1, 1, 1, 1]], dtype=torch.long)
+    mm_token_type_ids = torch.zeros_like(input_ids, dtype=torch.int)
     states = torch.randn(1, config.max_state_dim, dtype=torch.float32)
 
     actions = model.sample_actions(
         input_ids=input_ids,
         attention_mask=attention_mask,
+        mm_token_type_ids=mm_token_type_ids,
         states=states,
         state_token_id=state_token_id,
         action_token_id=action_token_id,
@@ -778,11 +755,13 @@ def test_eo1_sample_actions_supports_single_sample_eval_denoising():
         [[0, 0, state_token_id, 21, action_token_id, action_token_id, action_token_id, action_token_id]]
     )
     attention_mask = torch.tensor([[0, 0, 1, 1, 1, 1, 1, 1]], dtype=torch.long)
+    mm_token_type_ids = torch.zeros_like(input_ids, dtype=torch.int)
     states = torch.randn(1, config.max_state_dim, dtype=torch.float32)
 
     actions = model.sample_actions(
         input_ids=input_ids,
         attention_mask=attention_mask,
+        mm_token_type_ids=mm_token_type_ids,
         states=states,
         state_token_id=state_token_id,
         action_token_id=action_token_id,
@@ -811,10 +790,12 @@ def test_eo1_sample_actions_uses_aligned_left_padded_eval_prompts():
         ],
         dtype=torch.long,
     )
+    mm_token_type_ids = torch.zeros_like(input_ids, dtype=torch.int)
 
     actions = model.sample_actions(
         input_ids=input_ids,
         attention_mask=attention_mask,
+        mm_token_type_ids=mm_token_type_ids,
         action_token_id=action_token_id,
     )
 
@@ -825,9 +806,13 @@ def test_eo1_sample_actions_uses_aligned_left_padded_eval_prompts():
     assert prefill["inputs_embeds"].shape == (2, 5, config.text_config.hidden_size)
     assert prefill["attention_mask"][0].tolist() == [0, 0, 1, 1, 1]
     assert prefill["attention_mask"][1].tolist() == [1, 1, 1, 1, 1]
+    torch.testing.assert_close(prefill["mm_token_type_ids"], mm_token_type_ids[:, :5])
+    assert prefill["position_ids"] is None
     assert step_0["inputs_embeds"].shape[1] == config.chunk_size
-    assert step_0["attention_mask"].shape[1] == 9
-    assert step_1["attention_mask"].shape[1] == 9
+    assert step_0["attention_mask"] is None
+    assert step_1["attention_mask"] is None
+    assert step_0["position_ids"] is None
+    assert step_1["position_ids"] is None
 
 
 def test_eo1_sample_actions_raises_for_misaligned_action_spans():
@@ -849,11 +834,13 @@ def test_eo1_sample_actions_raises_for_misaligned_action_spans():
         ],
         dtype=torch.long,
     )
+    mm_token_type_ids = torch.zeros_like(input_ids, dtype=torch.int)
 
     with pytest.raises(ValueError, match="same action token mask after left padding"):
         model.sample_actions(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            mm_token_type_ids=mm_token_type_ids,
             action_token_id=action_token_id,
         )
 

@@ -17,20 +17,17 @@
 from copy import deepcopy
 from dataclasses import dataclass, field
 
-from lerobot.configs.policies import PreTrainedConfig
-from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
-from lerobot.optim.optimizers import AdamWConfig
-from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
-from lerobot.utils.constants import ACTION, OBS_STATE
-
-from .qwen2_5_vl.configuration_qwen2_5_vl import (
+from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
     Qwen2_5_VLConfig,
     Qwen2_5_VLTextConfig,
     Qwen2_5_VLVisionConfig,
 )
 
-if not hasattr(Qwen2_5_VLTextConfig, "pad_token_id"):
-    Qwen2_5_VLTextConfig.pad_token_id = None
+from lerobot.configs.policies import PreTrainedConfig
+from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
+from lerobot.optim.optimizers import AdamWConfig
+from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
+from lerobot.utils.constants import ACTION, OBS_STATE
 
 
 @PreTrainedConfig.register_subclass("eo1")
@@ -115,44 +112,12 @@ class EO1Config(PreTrainedConfig):
         if self.vlm_config is None:
             self.vlm_config = Qwen2_5_VLConfig.from_pretrained(self.vlm_base).to_dict()
 
-        self._patch_vlm_config_compatibility()
-
-    def _patch_vlm_config_compatibility(self) -> None:
-        """Backfill config keys that newer Transformers now expects explicitly."""
-        if not isinstance(self.vlm_config, dict):
-            return
-
-        text_config = self.vlm_config.get("text_config")
-        if not isinstance(text_config, dict):
-            return
-
-        pad_token_id = self.vlm_config.get("pad_token_id")
-        if pad_token_id is None:
-            pad_token_id = text_config.get("pad_token_id")
-        if pad_token_id is None:
-            pad_token_id = self.vlm_config.get("eos_token_id", text_config.get("eos_token_id"))
-        if pad_token_id is None:
-            pad_token_id = self.vlm_config.get("bos_token_id", text_config.get("bos_token_id"))
-
-        if pad_token_id is not None:
-            self.vlm_config.setdefault("pad_token_id", pad_token_id)
-            text_config.setdefault("pad_token_id", pad_token_id)
-
     @property
     def vlm_backbone_config(self) -> Qwen2_5_VLConfig:
         config_dict = deepcopy(self.vlm_config)
         if self.attn_implementation is not None:
             config_dict["attn_implementation"] = self.attn_implementation
-        backbone_config = Qwen2_5_VLConfig(**config_dict)
-
-        pad_token_id = config_dict.get("pad_token_id")
-        if pad_token_id is None:
-            pad_token_id = config_dict.get("eos_token_id", config_dict.get("bos_token_id"))
-        if pad_token_id is not None:
-            backbone_config.pad_token_id = pad_token_id
-            backbone_config.text_config.pad_token_id = pad_token_id
-
-        return backbone_config
+        return Qwen2_5_VLConfig(**config_dict)
 
     @property
     def text_config(self) -> Qwen2_5_VLTextConfig:

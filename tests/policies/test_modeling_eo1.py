@@ -264,6 +264,36 @@ def test_eo1_sample_time_uses_configured_distribution(monkeypatch):
     torch.testing.assert_close(sampled_time, torch.full((3,), 0.5, dtype=torch.float32))
 
 
+def test_eo1_forward_falls_back_to_max_action_dim_without_output_features():
+    config = make_test_config(dtype="float32")
+    config.output_features = {}
+    model = EO1VisionFlowMatchingModel(config, DummyVLMBackbone(config.text_config.hidden_size))
+
+    action_token_id = 7
+    input_ids = torch.tensor(
+        [
+            [
+                101,
+                action_token_id,
+                action_token_id,
+                action_token_id,
+                action_token_id,
+                action_token_id,
+                action_token_id,
+                action_token_id,
+                action_token_id,
+            ]
+        ],
+        dtype=torch.long,
+    )
+    action = torch.randn(1, config.chunk_size, config.max_action_dim, dtype=torch.float32)
+
+    loss = model(input_ids=input_ids, action=action, action_token_id=action_token_id)
+
+    assert loss is not None
+    assert loss.ndim == 0
+
+
 def test_eo1_bfloat16_backbone_and_fp32_flow_head():
     config = make_test_config(dtype="bfloat16")
     backbone = DummyVLMBackbone(config.text_config.hidden_size).to(dtype=torch.bfloat16)
@@ -496,8 +526,8 @@ def test_eo1_forward_loss_stays_fp32_inside_global_autocast():
             action_token_id=action_token_id,
         )
 
-    assert outputs.fm_loss is not None
-    assert outputs.fm_loss.dtype == torch.float32
+    assert outputs is not None
+    assert outputs.dtype == torch.float32
 
 
 def test_eo1_forward_uses_manual_checkpointing(monkeypatch):
@@ -530,7 +560,7 @@ def test_eo1_forward_uses_manual_checkpointing(monkeypatch):
         action_token_id=action_token_id,
     )
 
-    assert outputs.fm_loss is not None
+    assert outputs is not None
     assert calls == [
         "input_embed_func",
         "state_proj_func",
@@ -599,7 +629,7 @@ def test_eo1_padded_actions_follow_standard_diffusion_targets():
         action_token_id=action_token_id,
     )
 
-    assert outputs.fm_loss is not None
+    assert outputs is not None
     assert torch.allclose(
         captured["noisy_actions"],
         torch.full((1, config.chunk_size, config.max_action_dim), 2.0, dtype=torch.float32),

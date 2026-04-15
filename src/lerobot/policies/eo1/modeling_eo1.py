@@ -227,6 +227,12 @@ class EO1VisionFlowMatchingModel(nn.Module):
         self.action_time_mlp_out = nn.Linear(self.hidden_size, self.hidden_size, dtype=torch.float32)
         self.gradient_checkpointing_enabled = False
 
+    def _get_output_action_dim(self) -> int:
+        action_feature = self.config.output_features.get(ACTION)
+        if action_feature is None:
+            return self.config.max_action_dim
+        return action_feature.shape[0]
+
     def get_input_embeddings(self):
         return self.vlm_backbone.get_input_embeddings()
 
@@ -495,7 +501,7 @@ class EO1VisionFlowMatchingModel(nn.Module):
 
             v_t = self._apply_checkpoint(action_out_proj_func, action_hidden_states)
             u_t = u_t.reshape(v_t.shape)
-            original_action_dim = self.config.output_features[ACTION].shape[0]
+            original_action_dim = self._get_output_action_dim()
             u_t = u_t[:, :original_action_dim]
             v_t = v_t[:, :original_action_dim].to(dtype=u_t.dtype)
             fm_loss = F.mse_loss(u_t, v_t, reduction="mean")

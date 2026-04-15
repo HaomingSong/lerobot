@@ -140,7 +140,16 @@ class EO1Config(PreTrainedConfig):
         config_dict = deepcopy(self.vlm_config)
         if self.attn_implementation is not None:
             config_dict["attn_implementation"] = self.attn_implementation
-        return Qwen2_5_VLConfig(**config_dict)
+        backbone_config = Qwen2_5_VLConfig(**config_dict)
+
+        pad_token_id = config_dict.get("pad_token_id")
+        if pad_token_id is None:
+            pad_token_id = config_dict.get("eos_token_id", config_dict.get("bos_token_id"))
+        if pad_token_id is not None:
+            backbone_config.pad_token_id = pad_token_id
+            backbone_config.text_config.pad_token_id = pad_token_id
+
+        return backbone_config
 
     @property
     def text_config(self) -> Qwen2_5_VLTextConfig:

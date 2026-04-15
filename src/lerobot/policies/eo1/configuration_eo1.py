@@ -112,6 +112,29 @@ class EO1Config(PreTrainedConfig):
         if self.vlm_config is None:
             self.vlm_config = Qwen2_5_VLConfig.from_pretrained(self.vlm_base).to_dict()
 
+        self._patch_vlm_config_compatibility()
+
+    def _patch_vlm_config_compatibility(self) -> None:
+        """Backfill config keys that newer Transformers now expects explicitly."""
+        if not isinstance(self.vlm_config, dict):
+            return
+
+        text_config = self.vlm_config.get("text_config")
+        if not isinstance(text_config, dict):
+            return
+
+        pad_token_id = self.vlm_config.get("pad_token_id")
+        if pad_token_id is None:
+            pad_token_id = text_config.get("pad_token_id")
+        if pad_token_id is None:
+            pad_token_id = self.vlm_config.get("eos_token_id", text_config.get("eos_token_id"))
+        if pad_token_id is None:
+            pad_token_id = self.vlm_config.get("bos_token_id", text_config.get("bos_token_id"))
+
+        if pad_token_id is not None:
+            self.vlm_config.setdefault("pad_token_id", pad_token_id)
+            text_config.setdefault("pad_token_id", pad_token_id)
+
     @property
     def vlm_backbone_config(self) -> Qwen2_5_VLConfig:
         config_dict = deepcopy(self.vlm_config)

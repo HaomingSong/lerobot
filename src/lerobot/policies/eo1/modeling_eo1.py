@@ -318,13 +318,6 @@ class EO1VisionFlowMatchingModel(nn.Module):
 
         return special_state_mask, special_action_mask
 
-    def _infer_action_slice(self, action_mask: torch.BoolTensor) -> slice:
-        act_start = int(action_mask[0].to(torch.int64).argmax().item())
-        act_end = act_start + self.config.chunk_size
-        if not torch.all(action_mask[:, act_start:act_end]):
-            raise ValueError("Action tokens must form a contiguous chunk of length chunk_size.")
-        return slice(act_start, act_end)
-
     def embed_prefix(
         self,
         input_ids: torch.LongTensor,
@@ -537,9 +530,11 @@ class EO1VisionFlowMatchingModel(nn.Module):
             raise ValueError(
                 "Batch inference expects all samples to share the same action token mask after left padding."
             )
-        act_slice = self._infer_action_slice(action_mask)
-        act_start = act_slice.start
-        act_end = act_slice.stop
+        act_start = int(action_mask[0].to(torch.int64).argmax().item())
+        act_end = act_start + self.config.chunk_size
+        if not torch.all(action_mask[:, act_start:act_end]):
+            raise ValueError("Action tokens must form a contiguous chunk of length chunk_size.")
+        act_slice = slice(act_start, act_end)
 
         batch_size = input_ids.shape[0]
         device = inputs_embeds.device

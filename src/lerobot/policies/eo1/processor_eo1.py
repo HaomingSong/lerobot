@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import torch
-from transformers.models.qwen2_5_vl.processing_qwen2_5_vl import Qwen2_5_VLProcessor
+from transformers.models.qwen2_5_vl import Qwen2_5_VLProcessor
 
 from lerobot.configs.types import FeatureType, PipelineFeatureType, PolicyFeature
 from lerobot.policies.eo1.configuration_eo1 import EO1Config

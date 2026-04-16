@@ -28,9 +28,7 @@ import torch.nn.functional as F  # noqa: N812
 import torch.utils.checkpoint
 from torch import Tensor
 from transformers.activations import ACT2FN
-
-# HACK: shorter import?
-from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
+from transformers.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 
 from lerobot.policies.eo1.configuration_eo1 import EO1Config
 from lerobot.policies.pretrained import PreTrainedPolicy
@@ -279,47 +277,43 @@ class EO1VisionFlowMatchingModel(nn.Module):
         time = time_beta * self.config.time_sampling_scale + self.config.time_sampling_offset
         return time.to(dtype=torch.float32, device=device)
 
-    def scatter_special_token_features(
+    def get_placeholder_mask(
         self,
         input_ids: torch.LongTensor,
         inputs_embeds: torch.FloatTensor,
-        token_id: int | None,
-        features: torch.FloatTensor | None,
-    ) -> torch.FloatTensor:
-        if features is None or token_id is None:
-            return inputs_embeds
+        state_features: torch.FloatTensor | None = None,
+        action_features: torch.FloatTensor | None = None,
+        state_token_id: int | None = None,
+        action_token_id: int | None = None,
+    ) -> tuple[torch.BoolTensor, torch.BoolTensor]:
+        """Return EO1 state/action placeholder masks, following Qwen's multimodal mask style."""
+        if input_ids is None:
+            raise ValueError("input_ids are required to locate EO1 placeholder tokens.")
 
-        num_tokens = int((input_ids == token_id).sum().item())
-        num_features = features.shape[0]
-        assert num_tokens == num_features, (
-            f"Features do not match token count: tokens={num_tokens}, features={num_features}."
-        )
-        feature_mask = (input_ids == token_id).unsqueeze(-1).expand_as(inputs_embeds)
-        features = features.to(inputs_embeds.device, inputs_embeds.dtype)
-        return inputs_embeds.masked_scatter(feature_mask.to(inputs_embeds.device), features)
+        state_token_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+        if state_token_id is not None:
+            state_token_mask = input_ids == state_token_id
+        action_token_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+        if action_token_id is not None:
+            action_token_mask = input_ids == action_token_id
 
-    # HACK: could share same func with `scatter_special_token_features`, should follow the implementation of `get_placeholder_mask`
-    # in https://github.com/huggingface/transformers/blob/aad13b87ed59f2afcfaebc985f403301887a35fc/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py#L1232
-    def _get_action_token_mask(
-        self,
-        input_ids: torch.LongTensor,
-        action_token_id: int,
-        *,
-        require_shared_layout: bool = False,
-    ) -> torch.BoolTensor:
-        action_mask = input_ids == action_token_id
-        token_counts = action_mask.sum(dim=1)
-        if not torch.all(token_counts == self.config.chunk_size):
+        n_state_tokens = state_token_mask.sum()
+        state_mask = state_token_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+        if state_features is not None and inputs_embeds[state_mask].numel() != state_features.numel():
             raise ValueError(
-                f"Each sample must contain exactly {self.config.chunk_size} action tokens, got {token_counts.tolist()}."
+                f"State features and state tokens do not match, "
+                f"tokens: {n_state_tokens}, features: {state_features.shape[0]}."
             )
 
-        if require_shared_layout and action_mask.ne(action_mask[:1]).any():
+        n_action_tokens = action_token_mask.sum()
+        action_mask = action_token_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+        if action_features is not None and inputs_embeds[action_mask].numel() != action_features.numel():
             raise ValueError(
-                "Batch inference expects all samples to share the same action token mask after left padding."
+                f"Action features and action tokens do not match, "
+                f"tokens: {n_action_tokens}, features: {action_features.shape[0]}."
             )
 
-        return action_mask
+        return state_mask, action_mask
 
     def _infer_action_slice(self, action_mask: torch.BoolTensor) -> slice:
         act_start = int(action_mask[0].to(torch.int64).argmax().item())
@@ -331,8 +325,8 @@ class EO1VisionFlowMatchingModel(nn.Module):
     def embed_prefix(
         self,
         input_ids: torch.LongTensor,
-        states: torch.Tensor | None = None,
-        state_token_id: int | None = None,
+        states: torch.Tensor,
+        state_token_id: int,
     ) -> torch.FloatTensor:
         """Embed the EO1 prefix tokens before native Qwen injects multimodal features."""
 
@@ -348,16 +342,15 @@ class EO1VisionFlowMatchingModel(nn.Module):
                 states = self.maybe_cast_flow_head_input(states, self.state_proj.weight.dtype)
                 return self.state_proj(states)
 
-        # HACK: state is required, remove `if` and `None` in type hint
-        state_embs = None
-        if states is not None:
-            state_embs = self._apply_checkpoint(state_proj_func, states)
-        inputs_embeds = self.scatter_special_token_features(
+        state_embs = self._apply_checkpoint(state_proj_func, states)
+        state_mask, _ = self.get_placeholder_mask(
             input_ids,
             inputs_embeds,
-            state_token_id,
-            state_embs,
+            state_features=state_embs,
+            state_token_id=state_token_id,
         )
+        state_embs = state_embs.to(inputs_embeds.device, inputs_embeds.dtype)
+        inputs_embeds = inputs_embeds.masked_scatter(state_mask, state_embs)
         return inputs_embeds
 
     def embed_suffix(
@@ -412,6 +405,11 @@ class EO1VisionFlowMatchingModel(nn.Module):
         **kwargs,
     ) -> Tensor:
         """Run the EO1 training forward pass and compute the flow-matching loss."""
+        if states is None:
+            raise ValueError("states are required for EO1 forward.")
+        if mm_token_type_ids is None:
+            raise ValueError("mm_token_type_ids are required for EO1 forward.")
+
         inputs_embeds = self.embed_prefix(
             input_ids,
             states=states,
@@ -425,9 +423,12 @@ class EO1VisionFlowMatchingModel(nn.Module):
         x_t = time_expanded * noise + (1 - time_expanded) * action
         u_t = noise - action
         action_time_embs = self.embed_suffix(time, x_t)
-        action_token_mask = self._get_action_token_mask(input_ids, action_token_id)
-        action_mask = action_token_mask.unsqueeze(-1).expand_as(inputs_embeds)
-        action_mask = action_mask.to(inputs_embeds.device)
+        _, action_mask = self.get_placeholder_mask(
+            input_ids,
+            inputs_embeds,
+            action_features=action_time_embs,
+            action_token_id=action_token_id,
+        )
         action_time_embs = action_time_embs.to(inputs_embeds.device, inputs_embeds.dtype)
         inputs_embeds = inputs_embeds.masked_scatter(action_mask, action_time_embs)
 
@@ -498,37 +499,57 @@ class EO1VisionFlowMatchingModel(nn.Module):
         **kwargs,
     ) -> Tensor:
         """Sample actions from the model."""
-        chunk_size = self.config.chunk_size
+        if states is None:
+            raise ValueError("states are required for EO1 action sampling.")
+        if mm_token_type_ids is None:
+            raise ValueError("mm_token_type_ids are required for EO1 action sampling.")
 
-        action_mask = self._get_action_token_mask(
-            input_ids,
-            action_token_id,
-            require_shared_layout=True,
-        )
-        act_slice = self._infer_action_slice(action_mask)
-        act_start = act_slice.start
+        chunk_size = self.config.chunk_size
 
         inputs_embeds = self.embed_prefix(
             input_ids,
             states=states,
             state_token_id=state_token_id,
         ).clone()
+        _, action_placeholder_mask = self.get_placeholder_mask(
+            input_ids,
+            inputs_embeds,
+            action_token_id=action_token_id,
+        )
+        action_mask = action_placeholder_mask[..., 0]
+        token_counts = action_mask.sum(dim=1)
+        if not torch.all(token_counts == chunk_size):
+            raise ValueError(
+                f"Each sample must contain exactly {chunk_size} action tokens, got {token_counts.tolist()}."
+            )
+        if action_mask.ne(action_mask[:1]).any():
+            raise ValueError(
+                "Batch inference expects all samples to share the same action token mask after left padding."
+            )
+        act_slice = self._infer_action_slice(action_mask)
+        act_start = act_slice.start
+        act_end = act_slice.stop
 
         batch_size = input_ids.shape[0]
         device = inputs_embeds.device
         attention_mask = attention_mask.to(device)
-        prefix_mm_token_type_ids = None
-        if mm_token_type_ids is not None:
-            prefix_mm_token_type_ids = mm_token_type_ids[:, :act_start].to(device)
+        mm_token_type_ids = mm_token_type_ids.to(device)
+        position_ids, _ = self.vlm_backbone.model.get_rope_index(
+            input_ids,
+            image_grid_thw=image_grid_thw,
+            attention_mask=attention_mask,
+            mm_token_type_ids=mm_token_type_ids,
+        )
+        position_ids = position_ids.to(device)
 
         outputs = self.vlm_backbone.model(
             input_ids=input_ids[:, :act_start],
             attention_mask=attention_mask[:, :act_start],
+            position_ids=position_ids[..., :act_start],
             inputs_embeds=inputs_embeds[:, :act_start],
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
-            mm_token_type_ids=prefix_mm_token_type_ids,
-            position_ids=None,
+            mm_token_type_ids=mm_token_type_ids[:, :act_start],
             use_cache=True,
             return_dict=True,
         )
@@ -551,13 +572,12 @@ class EO1VisionFlowMatchingModel(nn.Module):
             inputs_embeds[:, act_slice] = action_time_embs.to(inputs_embeds.dtype)
 
             # Keep the prefix KV cache invariant across denoising steps.
-            # HACK: why sey attention_mask=None, should slice with act_end.
             past_key_values.crop(act_start)
             outputs = self.vlm_backbone.model(
-                attention_mask=None,
+                attention_mask=attention_mask[:, :act_end],
                 past_key_values=past_key_values,
                 inputs_embeds=inputs_embeds[:, act_slice],
-                position_ids=None,
+                position_ids=position_ids[..., act_slice],
                 use_cache=True,
                 return_dict=True,
             )

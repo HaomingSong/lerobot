@@ -46,14 +46,48 @@ class DummyVLMBackbone(nn.Module):
         self.rope_deltas = None
         self.forward_calls: list[dict[str, object]] = []
         self.model_calls: list[dict[str, object]] = []
+        self.rope_index_calls: list[dict[str, object]] = []
         self.gradient_checkpointing = False
         self.gradient_checkpointing_enable_calls: list[dict[str, object] | None] = []
         self.gradient_checkpointing_disable_calls = 0
         self.image_feature_calls: list[dict[str, object]] = []
         self.video_feature_calls: list[dict[str, object]] = []
 
+    @property
+    def model(self):
+        return self
+
     def get_input_embeddings(self):
         return self.embedding
+
+    def get_rope_index(
+        self,
+        input_ids: torch.Tensor,
+        image_grid_thw: torch.Tensor | None = None,
+        video_grid_thw: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        second_per_grid_ts: torch.Tensor | None = None,
+        mm_token_type_ids: torch.Tensor | None = None,
+    ):
+        self.rope_index_calls.append(
+            {
+                "input_ids": input_ids,
+                "image_grid_thw": image_grid_thw,
+                "video_grid_thw": video_grid_thw,
+                "attention_mask": attention_mask,
+                "second_per_grid_ts": second_per_grid_ts,
+                "mm_token_type_ids": mm_token_type_ids,
+            }
+        )
+        batch_size, seq_len = input_ids.shape
+        if attention_mask is not None:
+            text_positions = attention_mask.long().cumsum(-1) - 1
+            text_positions = text_positions.masked_fill(attention_mask == 0, 0)
+        else:
+            text_positions = torch.arange(seq_len, device=input_ids.device).expand(batch_size, -1)
+        position_ids = text_positions.view(1, batch_size, seq_len).expand(3, batch_size, seq_len)
+        rope_deltas = torch.zeros(batch_size, 1, dtype=torch.long, device=input_ids.device)
+        return position_ids, rope_deltas
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs: dict[str, object] | None = None):
         self.gradient_checkpointing = True
@@ -63,7 +97,7 @@ class DummyVLMBackbone(nn.Module):
         self.gradient_checkpointing = False
         self.gradient_checkpointing_disable_calls += 1
 
-    def model(
+    def forward(
         self,
         *,
         input_ids: torch.Tensor | None = None,
@@ -97,30 +131,6 @@ class DummyVLMBackbone(nn.Module):
         return SimpleNamespace(
             last_hidden_state=inputs_embeds,
             past_key_values=SimpleNamespace(crop=lambda prefix_len: None),
-        )
-
-    def forward(
-        self,
-        *,
-        attention_mask: torch.Tensor | None = None,
-        inputs_embeds: torch.Tensor | None = None,
-        image_grid_thw: torch.Tensor | None = None,
-        logits_to_keep: int | None = None,
-        **kwargs,
-    ):
-        self.forward_calls.append(
-            {
-                "attention_mask": attention_mask,
-                "inputs_embeds": inputs_embeds,
-                "image_grid_thw": image_grid_thw,
-                "logits_to_keep": logits_to_keep,
-            }
-        )
-        return SimpleNamespace(
-            hidden_states=inputs_embeds,
-            logits=None,
-            past_key_values=None,
-            attentions=None,
         )
 
 
@@ -446,17 +456,29 @@ def test_eo1_embed_suffix_uses_manual_checkpointing(monkeypatch):
 def test_eo1_forward_loss_stays_fp32_inside_global_autocast():
     config = make_test_config(dtype="bfloat16")
     model = EO1VisionFlowMatchingModel(config, DummyVLMBackbone(config.text_config.hidden_size))
+    state_token_id = 9
     action_token_id = 7
 
-    input_ids = torch.full((1, config.chunk_size), action_token_id, dtype=torch.long)
+    input_ids = torch.cat(
+        [
+            torch.full((1, 1), state_token_id, dtype=torch.long),
+            torch.full((1, config.chunk_size), action_token_id, dtype=torch.long),
+        ],
+        dim=1,
+    )
     attention_mask = torch.ones_like(input_ids)
+    mm_token_type_ids = torch.zeros_like(input_ids, dtype=torch.int)
+    states = torch.randn(1, config.max_state_dim, dtype=torch.float32)
     action = torch.randn(1, config.chunk_size, config.max_action_dim, dtype=torch.float32)
 
     with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
         loss = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            mm_token_type_ids=mm_token_type_ids,
+            states=states,
             action=action,
+            state_token_id=state_token_id,
             action_token_id=action_token_id,
         )
 
@@ -559,9 +581,18 @@ def test_eo1_padded_actions_follow_standard_diffusion_targets():
     action_token_id = 7
 
     loss = model(
-        input_ids=torch.full((1, config.chunk_size), action_token_id, dtype=torch.long),
-        attention_mask=torch.ones(1, config.chunk_size, dtype=torch.long),
+        input_ids=torch.cat(
+            [
+                torch.full((1, 1), 9, dtype=torch.long),
+                torch.full((1, config.chunk_size), action_token_id, dtype=torch.long),
+            ],
+            dim=1,
+        ),
+        attention_mask=torch.ones(1, config.chunk_size + 1, dtype=torch.long),
+        mm_token_type_ids=torch.zeros(1, config.chunk_size + 1, dtype=torch.int),
+        states=torch.randn(1, config.max_state_dim, dtype=torch.float32),
         action=action,
+        state_token_id=9,
         action_is_pad=action_is_pad,
         action_token_id=action_token_id,
     )
@@ -614,9 +645,18 @@ def test_eo1_flow_loss_ignores_padded_action_dimensions():
     action[:, :, : config.output_features["action"].shape[0]] = 1.0
 
     loss = model(
-        input_ids=torch.full((1, config.chunk_size), 7, dtype=torch.long),
-        attention_mask=torch.ones(1, config.chunk_size, dtype=torch.long),
+        input_ids=torch.cat(
+            [
+                torch.full((1, 1), 9, dtype=torch.long),
+                torch.full((1, config.chunk_size), 7, dtype=torch.long),
+            ],
+            dim=1,
+        ),
+        attention_mask=torch.ones(1, config.chunk_size + 1, dtype=torch.long),
+        mm_token_type_ids=torch.zeros(1, config.chunk_size + 1, dtype=torch.int),
+        states=torch.randn(1, config.max_state_dim, dtype=torch.float32),
         action=action,
+        state_token_id=9,
         action_token_id=7,
     )
 
@@ -673,7 +713,8 @@ def test_eo1_sample_actions_supports_batched_eval_denoising():
             torch.full((batch_size,), expected, dtype=torch.float32),
         )
     prefill = model.vlm_backbone.model_calls[0]
-    assert prefill["position_ids"] is None
+    assert prefill["position_ids"] is not None
+    assert prefill["position_ids"].shape == (3, batch_size, 1)
     torch.testing.assert_close(prefill["mm_token_type_ids"], mm_token_type_ids[:, :1])
 
 
@@ -719,7 +760,7 @@ def test_eo1_sample_actions_crops_cache_back_to_prefix_each_step(monkeypatch):
             cache = past_key_values
         return SimpleNamespace(last_hidden_state=inputs_embeds, past_key_values=cache)
 
-    monkeypatch.setattr(model.vlm_backbone, "model", fake_model)
+    monkeypatch.setattr(model.vlm_backbone, "forward", fake_model)
 
     action_token_id = 7
     state_token_id = 9
@@ -776,10 +817,11 @@ def test_eo1_sample_actions_uses_aligned_left_padded_eval_prompts():
     model = EO1VisionFlowMatchingModel(config, DummyVLMBackbone(config.text_config.hidden_size))
 
     action_token_id = 7
+    state_token_id = 9
     input_ids = torch.tensor(
         [
-            [0, 0, 101, 102, 103, 7, 7, 7, 7, 201],
-            [111, 112, 113, 114, 115, 7, 7, 7, 7, 202],
+            [0, 0, state_token_id, 102, 103, 7, 7, 7, 7, 201],
+            [111, 112, state_token_id, 114, 115, 7, 7, 7, 7, 202],
         ],
         dtype=torch.long,
     )
@@ -791,11 +833,14 @@ def test_eo1_sample_actions_uses_aligned_left_padded_eval_prompts():
         dtype=torch.long,
     )
     mm_token_type_ids = torch.zeros_like(input_ids, dtype=torch.int)
+    states = torch.randn(2, config.max_state_dim, dtype=torch.float32)
 
     actions = model.sample_actions(
         input_ids=input_ids,
         attention_mask=attention_mask,
         mm_token_type_ids=mm_token_type_ids,
+        states=states,
+        state_token_id=state_token_id,
         action_token_id=action_token_id,
     )
 
@@ -807,12 +852,12 @@ def test_eo1_sample_actions_uses_aligned_left_padded_eval_prompts():
     assert prefill["attention_mask"][0].tolist() == [0, 0, 1, 1, 1]
     assert prefill["attention_mask"][1].tolist() == [1, 1, 1, 1, 1]
     torch.testing.assert_close(prefill["mm_token_type_ids"], mm_token_type_ids[:, :5])
-    assert prefill["position_ids"] is None
+    assert prefill["position_ids"].shape == (3, 2, 5)
     assert step_0["inputs_embeds"].shape[1] == config.chunk_size
-    assert step_0["attention_mask"] is None
-    assert step_1["attention_mask"] is None
-    assert step_0["position_ids"] is None
-    assert step_1["position_ids"] is None
+    torch.testing.assert_close(step_0["attention_mask"], attention_mask[:, :9])
+    torch.testing.assert_close(step_1["attention_mask"], attention_mask[:, :9])
+    assert step_0["position_ids"].shape == (3, 2, config.chunk_size)
+    assert step_1["position_ids"].shape == (3, 2, config.chunk_size)
 
 
 def test_eo1_sample_actions_raises_for_misaligned_action_spans():
@@ -820,10 +865,11 @@ def test_eo1_sample_actions_raises_for_misaligned_action_spans():
     model = EO1VisionFlowMatchingModel(config, DummyVLMBackbone(config.text_config.hidden_size))
 
     action_token_id = 7
+    state_token_id = 9
     input_ids = torch.tensor(
         [
-            [101, 102, 103, 7, 7, 7, 7, 201, 202, 0, 0, 0],
-            [111, 112, 113, 114, 115, 7, 7, 7, 7, 211, 212, 213],
+            [101, 102, state_token_id, 7, 7, 7, 7, 201, 202, 0, 0, 0],
+            [111, 112, state_token_id, 114, 115, 7, 7, 7, 7, 211, 212, 213],
         ],
         dtype=torch.long,
     )
@@ -835,12 +881,15 @@ def test_eo1_sample_actions_raises_for_misaligned_action_spans():
         dtype=torch.long,
     )
     mm_token_type_ids = torch.zeros_like(input_ids, dtype=torch.int)
+    states = torch.randn(2, config.max_state_dim, dtype=torch.float32)
 
     with pytest.raises(ValueError, match="same action token mask after left padding"):
         model.sample_actions(
             input_ids=input_ids,
             attention_mask=attention_mask,
             mm_token_type_ids=mm_token_type_ids,
+            states=states,
+            state_token_id=state_token_id,
             action_token_id=action_token_id,
         )
 

@@ -29,6 +29,7 @@ import torch.utils.checkpoint
 from torch import Tensor
 from transformers.activations import ACT2FN
 from transformers.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
+from transformers.utils import torch_compilable_check
 
 from lerobot.policies.eo1.configuration_eo1 import EO1Config
 from lerobot.policies.pretrained import PreTrainedPolicy
@@ -279,41 +280,48 @@ class EO1VisionFlowMatchingModel(nn.Module):
 
     def get_placeholder_mask(
         self,
-        input_ids: torch.LongTensor,
-        inputs_embeds: torch.FloatTensor,
+        input_ids: torch.LongTensor | None,
+        inputs_embeds: torch.FloatTensor | None,
         state_features: torch.FloatTensor | None = None,
         action_features: torch.FloatTensor | None = None,
-        state_token_id: int | None = None,
-        action_token_id: int | None = None,
+        state_token_id: int = 151669,
+        action_token_id: int = 151666,
     ) -> tuple[torch.BoolTensor, torch.BoolTensor]:
         """Return EO1 state/action placeholder masks, following Qwen's multimodal mask style."""
         if input_ids is None:
-            raise ValueError("input_ids are required to locate EO1 placeholder tokens.")
+            special_state_mask = inputs_embeds == self.get_input_embeddings()(
+                torch.tensor(state_token_id, dtype=torch.long, device=inputs_embeds.device)
+            )
+            special_state_mask = special_state_mask.all(-1)
+            special_action_mask = inputs_embeds == self.get_input_embeddings()(
+                torch.tensor(action_token_id, dtype=torch.long, device=inputs_embeds.device)
+            )
+            special_action_mask = special_action_mask.all(-1)
+        else:
+            special_state_mask = input_ids == state_token_id
+            special_action_mask = input_ids == action_token_id
 
-        state_token_mask = torch.zeros_like(input_ids, dtype=torch.bool)
-        if state_token_id is not None:
-            state_token_mask = input_ids == state_token_id
-        action_token_mask = torch.zeros_like(input_ids, dtype=torch.bool)
-        if action_token_id is not None:
-            action_token_mask = input_ids == action_token_id
-
-        n_state_tokens = state_token_mask.sum()
-        state_mask = state_token_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
-        if state_features is not None and inputs_embeds[state_mask].numel() != state_features.numel():
-            raise ValueError(
-                f"State features and state tokens do not match, "
-                f"tokens: {n_state_tokens}, features: {state_features.shape[0]}."
+        n_state_tokens = special_state_mask.sum()
+        special_state_mask = (
+            special_state_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+        )
+        if state_features is not None:
+            torch_compilable_check(
+                inputs_embeds[special_state_mask].numel() == state_features.numel(),
+                f"State features and state tokens do not match, tokens: {n_state_tokens}, features: {state_features.shape[0]}",
             )
 
-        n_action_tokens = action_token_mask.sum()
-        action_mask = action_token_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
-        if action_features is not None and inputs_embeds[action_mask].numel() != action_features.numel():
-            raise ValueError(
-                f"Action features and action tokens do not match, "
-                f"tokens: {n_action_tokens}, features: {action_features.shape[0]}."
+        n_action_tokens = special_action_mask.sum()
+        special_action_mask = (
+            special_action_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+        )
+        if action_features is not None:
+            torch_compilable_check(
+                inputs_embeds[special_action_mask].numel() == action_features.numel(),
+                f"Action features and action tokens do not match, tokens: {n_action_tokens}, features: {action_features.shape[0]}",
             )
 
-        return state_mask, action_mask
+        return special_state_mask, special_action_mask
 
     def _infer_action_slice(self, action_mask: torch.BoolTensor) -> slice:
         act_start = int(action_mask[0].to(torch.int64).argmax().item())

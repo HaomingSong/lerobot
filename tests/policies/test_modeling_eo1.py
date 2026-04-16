@@ -604,6 +604,59 @@ def test_eo1_padded_actions_follow_standard_diffusion_targets():
     )
 
 
+def test_eo1_can_leave_padded_actions_unnoised():
+    config = make_test_config(dtype="bfloat16", supervise_padding_actions=False)
+    model = EO1VisionFlowMatchingModel(config, DummyVLMBackbone(config.text_config.hidden_size))
+
+    action = torch.zeros(1, config.chunk_size, config.max_action_dim, dtype=torch.float32)
+    action_is_pad = torch.zeros(1, config.chunk_size, dtype=torch.bool)
+    action_is_pad[:, config.chunk_size // 2 :] = True
+
+    model.sample_time = lambda bsize, device: torch.full((bsize,), 0.5, dtype=torch.float32, device=device)
+    model.sample_noise = lambda shape, device: torch.full(shape, 4.0, dtype=torch.float32, device=device)
+
+    captured: dict[str, torch.Tensor] = {}
+
+    def fake_embed_suffix(timestep: torch.Tensor, noisy_actions: torch.Tensor) -> torch.Tensor:
+        captured["timestep"] = timestep.detach().clone()
+        captured["noisy_actions"] = noisy_actions.detach().clone()
+        return torch.zeros(
+            noisy_actions.shape[0],
+            noisy_actions.shape[1],
+            config.text_config.hidden_size,
+            dtype=torch.float32,
+            device=noisy_actions.device,
+        )
+
+    model.embed_suffix = fake_embed_suffix
+    action_token_id = 7
+
+    loss = model(
+        input_ids=torch.cat(
+            [
+                torch.full((1, 1), 9, dtype=torch.long),
+                torch.full((1, config.chunk_size), action_token_id, dtype=torch.long),
+            ],
+            dim=1,
+        ),
+        attention_mask=torch.ones(1, config.chunk_size + 1, dtype=torch.long),
+        mm_token_type_ids=torch.zeros(1, config.chunk_size + 1, dtype=torch.int),
+        states=torch.randn(1, config.max_state_dim, dtype=torch.float32),
+        action=action,
+        action_is_pad=action_is_pad,
+        state_token_id=9,
+        action_token_id=action_token_id,
+    )
+
+    expected_noisy_actions = torch.full(
+        (1, config.chunk_size, config.max_action_dim), 2.0, dtype=torch.float32
+    )
+    expected_noisy_actions[:, config.chunk_size // 2 :] = 0.0
+    assert loss is not None
+    torch.testing.assert_close(captured["timestep"], torch.tensor([0.5], dtype=torch.float32))
+    torch.testing.assert_close(captured["noisy_actions"], expected_noisy_actions)
+
+
 def test_eo1_flow_loss_ignores_padded_action_dimensions():
     config = make_test_config(
         dtype="bfloat16",
@@ -724,6 +777,60 @@ def test_eo1_flow_loss_can_supervise_padded_action_dimensions():
 
     assert loss is not None
     assert loss.item() == pytest.approx(0.25)
+
+
+def test_eo1_flow_loss_can_ignore_padded_actions():
+    config = make_test_config(dtype="bfloat16", supervise_padding_actions=False)
+    model = EO1VisionFlowMatchingModel(config, DummyVLMBackbone(config.text_config.hidden_size))
+
+    class ZeroActionOutProj(nn.Module):
+        @property
+        def dtype(self):
+            return torch.float32
+
+        def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+            return torch.zeros(
+                hidden_states.shape[0],
+                config.max_action_dim,
+                dtype=torch.float32,
+                device=hidden_states.device,
+            )
+
+    model.sample_time = lambda bsize, device: torch.full((bsize,), 0.5, dtype=torch.float32, device=device)
+    model.sample_noise = lambda shape, device: torch.zeros(shape, dtype=torch.float32, device=device)
+    model.embed_suffix = lambda timestep, noisy_actions: torch.zeros(
+        noisy_actions.shape[0],
+        noisy_actions.shape[1],
+        config.text_config.hidden_size,
+        dtype=torch.float32,
+        device=noisy_actions.device,
+    )
+    model.action_out_proj = ZeroActionOutProj()
+
+    action = torch.ones(1, config.chunk_size, config.max_action_dim, dtype=torch.float32)
+    action_is_pad = torch.zeros(1, config.chunk_size, dtype=torch.bool)
+    action_is_pad[:, config.chunk_size // 2 :] = True
+    action[:, config.chunk_size // 2 :] = 3.0
+
+    loss = model(
+        input_ids=torch.cat(
+            [
+                torch.full((1, 1), 9, dtype=torch.long),
+                torch.full((1, config.chunk_size), 7, dtype=torch.long),
+            ],
+            dim=1,
+        ),
+        attention_mask=torch.ones(1, config.chunk_size + 1, dtype=torch.long),
+        mm_token_type_ids=torch.zeros(1, config.chunk_size + 1, dtype=torch.int),
+        states=torch.randn(1, config.max_state_dim, dtype=torch.float32),
+        action=action,
+        action_is_pad=action_is_pad,
+        state_token_id=9,
+        action_token_id=7,
+    )
+
+    assert loss is not None
+    assert loss.item() == pytest.approx(1.0)
 
 
 def test_eo1_sample_actions_supports_batched_eval_denoising():

@@ -486,9 +486,11 @@ class EO1VisionFlowMatchingModel(nn.Module):
 
         v_t = self._apply_checkpoint(action_out_proj_func, action_hidden_states)
         u_t = u_t.reshape(v_t.shape)
-        original_action_dim = self.config.output_features[ACTION].shape[0]
-        u_t = u_t[:, :original_action_dim]
-        v_t = v_t[:, :original_action_dim].to(dtype=u_t.dtype)
+        if not self.config.supervise_padding_action_dims:
+            original_action_dim = self.config.output_features[ACTION].shape[0]
+            u_t = u_t[:, :original_action_dim]
+            v_t = v_t[:, :original_action_dim]
+        v_t = v_t.to(dtype=u_t.dtype)
         fm_loss = F.mse_loss(u_t, v_t, reduction="mean")
 
         return fm_loss

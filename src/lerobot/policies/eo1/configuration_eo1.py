@@ -62,6 +62,7 @@ class EO1Config(PreTrainedConfig):
     time_sampling_offset: float = 0.001
     min_period: float = 4e-3
     max_period: float = 4.0
+    supervise_padding_action_dims: bool = True
 
     # Policy-level dtype request for the Qwen backbone.
     # - "auto": follow the backbone config/checkpoint default dtype. For Qwen2.5-VL this resolves to bf16.

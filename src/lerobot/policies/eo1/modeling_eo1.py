@@ -17,8 +17,10 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import math
+import os
 from collections import deque
 from typing import Any
 
@@ -222,6 +224,7 @@ class EO1VisionFlowMatchingModel(nn.Module):
         self.action_time_mlp_in = nn.Linear(self.hidden_size * 2, self.hidden_size, dtype=torch.float32)
         self.action_time_mlp_out = nn.Linear(self.hidden_size, self.hidden_size, dtype=torch.float32)
         self.gradient_checkpointing_enabled = False
+        self._flow_head_probe_emitted: set[str] = set()
 
     def get_input_embeddings(self):
         return self.vlm_backbone.get_input_embeddings()
@@ -234,10 +237,61 @@ class EO1VisionFlowMatchingModel(nn.Module):
             )
         return contextlib.nullcontext()
 
-    def maybe_cast_flow_head_input(self, x: torch.Tensor, target_dtype: torch.dtype) -> torch.Tensor:
-        if self.config.force_fp32_autocast:
-            return x.to(dtype=target_dtype)
-        return x
+    def _record_flow_head_probe(
+        self,
+        *,
+        callsite: str | None,
+        x: torch.Tensor,
+        target_dtype: torch.dtype,
+        output: torch.Tensor,
+    ) -> None:
+        probe_path = os.environ.get("EO1_FLOW_DTYPE_PROBE_FILE")
+        if not probe_path or callsite is None:
+            return
+
+        if os.environ.get("RANK", "0") != "0":
+            return
+
+        mode = "train" if self.training else "eval"
+        probe_key = f"{mode}:{callsite}"
+        if probe_key in self._flow_head_probe_emitted:
+            return
+
+        probe_dir = os.path.dirname(probe_path)
+        if probe_dir:
+            os.makedirs(probe_dir, exist_ok=True)
+
+        payload = {
+            "callsite": callsite,
+            "mode": mode,
+            "force_fp32_autocast": self.config.force_fp32_autocast,
+            "autocast_enabled": torch.is_autocast_enabled(),
+            "device": str(x.device),
+            "input_dtype": str(x.dtype),
+            "target_dtype": str(target_dtype),
+            "output_dtype": str(output.dtype),
+            "input_shape": list(x.shape),
+            "rank": os.environ.get("RANK", "0"),
+        }
+        with open(probe_path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, sort_keys=True) + "\n")
+        self._flow_head_probe_emitted.add(probe_key)
+
+    def maybe_cast_flow_head_input(
+        self,
+        x: torch.Tensor,
+        target_dtype: torch.dtype,
+        *,
+        callsite: str | None = None,
+    ) -> torch.Tensor:
+        output = x.to(dtype=target_dtype) if self.config.force_fp32_autocast else x
+        self._record_flow_head_probe(
+            callsite=callsite,
+            x=x,
+            target_dtype=target_dtype,
+            output=output,
+        )
+        return output
 
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for the Qwen2.5-VL backbone."""
@@ -347,7 +401,11 @@ class EO1VisionFlowMatchingModel(nn.Module):
         # Project the states to the hidden size
         def state_proj_func(states: torch.Tensor) -> torch.FloatTensor:
             with self.flow_head_autocast_context():
-                states = self.maybe_cast_flow_head_input(states, self.state_proj.weight.dtype)
+                states = self.maybe_cast_flow_head_input(
+                    states,
+                    self.state_proj.weight.dtype,
+                    callsite="embed_prefix.state_proj",
+                )
                 return self.state_proj(states)
 
         state_embs = self._apply_checkpoint(state_proj_func, states)
@@ -371,7 +429,9 @@ class EO1VisionFlowMatchingModel(nn.Module):
         def action_proj_func(noisy_actions: torch.Tensor) -> torch.FloatTensor:
             with self.flow_head_autocast_context():
                 noisy_actions = self.maybe_cast_flow_head_input(
-                    noisy_actions, self.action_in_proj.weight.dtype
+                    noisy_actions,
+                    self.action_in_proj.weight.dtype,
+                    callsite="embed_suffix.action_in_proj",
                 )
                 return self.action_in_proj(noisy_actions)
 
@@ -390,7 +450,9 @@ class EO1VisionFlowMatchingModel(nn.Module):
         def mlp_func(action_time_embs: torch.Tensor) -> torch.FloatTensor:
             with self.flow_head_autocast_context():
                 action_time_embs = self.maybe_cast_flow_head_input(
-                    action_time_embs, self.action_time_mlp_in.weight.dtype
+                    action_time_embs,
+                    self.action_time_mlp_in.weight.dtype,
+                    callsite="embed_suffix.action_time_mlp",
                 )
                 action_time_embs = self.action_time_mlp_in(action_time_embs)
                 action_time_embs = F.silu(action_time_embs)
@@ -480,7 +542,9 @@ class EO1VisionFlowMatchingModel(nn.Module):
         def action_out_proj_func(action_hidden_states: torch.FloatTensor) -> torch.FloatTensor:
             with self.flow_head_autocast_context():
                 action_hidden_states = self.maybe_cast_flow_head_input(
-                    action_hidden_states, self.action_out_proj.dtype
+                    action_hidden_states,
+                    self.action_out_proj.dtype,
+                    callsite="forward.action_out_proj",
                 )
                 return self.action_out_proj(action_hidden_states)
 
@@ -593,7 +657,11 @@ class EO1VisionFlowMatchingModel(nn.Module):
             )
             with self.flow_head_autocast_context():
                 hidden_states = outputs.last_hidden_state[:, :chunk_size]
-                hidden_states = self.maybe_cast_flow_head_input(hidden_states, self.action_out_proj.dtype)
+                hidden_states = self.maybe_cast_flow_head_input(
+                    hidden_states,
+                    self.action_out_proj.dtype,
+                    callsite="sample_actions.action_out_proj",
+                )
                 v_t = self.action_out_proj(hidden_states)
 
             x_t += dt * v_t.reshape(x_t.shape)

@@ -234,11 +234,6 @@ class EO1VisionFlowMatchingModel(nn.Module):
             )
         return contextlib.nullcontext()
 
-    def maybe_cast_flow_head_input(self, x: torch.Tensor, target_dtype: torch.dtype) -> torch.Tensor:
-        if self.config.force_fp32_autocast:
-            return x.to(dtype=target_dtype)
-        return x
-
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for the Qwen2.5-VL backbone."""
         self.gradient_checkpointing_enabled = True
@@ -347,7 +342,7 @@ class EO1VisionFlowMatchingModel(nn.Module):
         # Project the states to the hidden size
         def state_proj_func(states: torch.Tensor) -> torch.FloatTensor:
             with self.flow_head_autocast_context():
-                states = self.maybe_cast_flow_head_input(states, self.state_proj.weight.dtype)
+                states = states.to(dtype=self.state_proj.weight.dtype)
                 return self.state_proj(states)
 
         state_embs = self._apply_checkpoint(state_proj_func, states)
@@ -370,9 +365,7 @@ class EO1VisionFlowMatchingModel(nn.Module):
 
         def action_proj_func(noisy_actions: torch.Tensor) -> torch.FloatTensor:
             with self.flow_head_autocast_context():
-                noisy_actions = self.maybe_cast_flow_head_input(
-                    noisy_actions, self.action_in_proj.weight.dtype
-                )
+                noisy_actions = noisy_actions.to(dtype=self.action_in_proj.weight.dtype)
                 return self.action_in_proj(noisy_actions)
 
         action_embs = self._apply_checkpoint(action_proj_func, noisy_actions)
@@ -389,9 +382,7 @@ class EO1VisionFlowMatchingModel(nn.Module):
 
         def mlp_func(action_time_embs: torch.Tensor) -> torch.FloatTensor:
             with self.flow_head_autocast_context():
-                action_time_embs = self.maybe_cast_flow_head_input(
-                    action_time_embs, self.action_time_mlp_in.weight.dtype
-                )
+                action_time_embs = action_time_embs.to(dtype=self.action_time_mlp_in.weight.dtype)
                 action_time_embs = self.action_time_mlp_in(action_time_embs)
                 action_time_embs = F.silu(action_time_embs)
                 return self.action_time_mlp_out(action_time_embs)
@@ -485,9 +476,7 @@ class EO1VisionFlowMatchingModel(nn.Module):
         # compute the flow-matching loss
         def action_out_proj_func(action_hidden_states: torch.FloatTensor) -> torch.FloatTensor:
             with self.flow_head_autocast_context():
-                action_hidden_states = self.maybe_cast_flow_head_input(
-                    action_hidden_states, self.action_out_proj.dtype
-                )
+                action_hidden_states = action_hidden_states.to(dtype=self.action_out_proj.dtype)
                 return self.action_out_proj(action_hidden_states)
 
         v_t = self._apply_checkpoint(action_out_proj_func, action_hidden_states)
@@ -605,7 +594,7 @@ class EO1VisionFlowMatchingModel(nn.Module):
             )
             with self.flow_head_autocast_context():
                 hidden_states = outputs.last_hidden_state[:, :chunk_size]
-                hidden_states = self.maybe_cast_flow_head_input(hidden_states, self.action_out_proj.dtype)
+                hidden_states = hidden_states.to(dtype=self.action_out_proj.dtype)
                 v_t = self.action_out_proj(hidden_states)
 
             x_t += dt * v_t.reshape(x_t.shape)

@@ -386,13 +386,13 @@ class EO1VisionFlowMatchingModel(nn.Module):
     def forward(
         self,
         input_ids: torch.LongTensor | None = None,
-        attention_mask: torch.Tensor | None = None,
-        pixel_values: torch.Tensor | None = None,
+        attention_mask: torch.LongTensor | None = None,
+        pixel_values: torch.FloatTensor | None = None,
         image_grid_thw: torch.LongTensor | None = None,
         mm_token_type_ids: torch.IntTensor | None = None,
-        states: torch.Tensor | None = None,
-        action: torch.Tensor | None = None,
-        action_is_pad: torch.Tensor | None = None,
+        states: torch.FloatTensor | None = None,
+        action: torch.FloatTensor | None = None,
+        action_is_pad: torch.BoolTensor | None = None,
         state_token_id: int = 151669,
         action_token_id: int = 151666,
         **kwargs,
@@ -545,6 +545,49 @@ class EO1VisionFlowMatchingModel(nn.Module):
         )
         position_ids = position_ids.to(device)
 
+        x_t = self.sample_noise(
+            (batch_size, chunk_size, self.config.max_action_dim),
+            device,
+        ).to(dtype=self.action_in_proj.weight.dtype)
+        dt = -1.0 / self.config.num_denoise_steps
+
+        has_left_padding = bool((attention_mask[:, 0] == 0).any().item())
+        if has_left_padding:
+            logger.warning_once(
+                "EO1 sample_actions detected left padding in a batched decode request; "
+                "falling back to full no-cache denoising because cached KV reuse is not "
+                "aligned with left-padded prefixes under the current Qwen2.5-VL attention APIs."
+            )
+            for step in range(self.config.num_denoise_steps):
+                time = torch.full(
+                    (batch_size,),
+                    1.0 + step * dt,
+                    device=device,
+                    dtype=torch.float32,
+                )
+                action_time_embs = self.embed_suffix(time, x_t)
+                inputs_embeds[:, act_slice] = action_time_embs.to(inputs_embeds.dtype)
+
+                outputs = self.vlm_backbone.model(
+                    input_ids=input_ids[:, :act_end],
+                    attention_mask=attention_mask[:, :act_end],
+                    position_ids=position_ids[..., :act_end],
+                    inputs_embeds=inputs_embeds[:, :act_end],
+                    pixel_values=pixel_values,
+                    image_grid_thw=image_grid_thw,
+                    mm_token_type_ids=mm_token_type_ids[:, :act_end],
+                    use_cache=False,
+                    return_dict=True,
+                )
+                with self.flow_head_autocast_context():
+                    hidden_states = outputs.last_hidden_state[:, act_slice]
+                    hidden_states = hidden_states.to(dtype=self.action_out_proj.dtype)
+                    v_t = self.action_out_proj(hidden_states)
+
+                x_t += dt * v_t.reshape(x_t.shape)
+
+            return x_t
+
         outputs = self.vlm_backbone.model(
             input_ids=input_ids[:, :act_start],
             attention_mask=attention_mask[:, :act_start],
@@ -556,12 +599,6 @@ class EO1VisionFlowMatchingModel(nn.Module):
             use_cache=True,
             return_dict=True,
         )
-
-        x_t = self.sample_noise(
-            (batch_size, chunk_size, self.config.max_action_dim),
-            device,
-        ).to(dtype=self.action_in_proj.weight.dtype)
-        dt = -1.0 / self.config.num_denoise_steps
         past_key_values = outputs.past_key_values
 
         for step in range(self.config.num_denoise_steps):

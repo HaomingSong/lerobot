@@ -398,14 +398,6 @@ class EO1VisionFlowMatchingModel(nn.Module):
         **kwargs,
     ) -> Tensor:
         """Run the EO1 training forward pass and compute the flow-matching loss."""
-        if states is None:
-            raise ValueError("states are required for EO1 forward.")
-        if action is None:
-            raise ValueError("action is required for EO1 forward.")
-        if attention_mask is None:
-            raise ValueError("attention_mask is required for EO1 forward.")
-        if mm_token_type_ids is None:
-            raise ValueError("mm_token_type_ids are required for EO1 forward.")
 
         inputs_embeds = self.embed_prefix(
             input_ids,
@@ -416,17 +408,7 @@ class EO1VisionFlowMatchingModel(nn.Module):
         # Scatter the action tokens into the inputs embeddings
         time = self.sample_time(action.shape[0], inputs_embeds.device)
         noise = self.sample_noise(action.shape, inputs_embeds.device)
-        valid_action_mask = None
-        if not self.config.supervise_padding_actions:
-            if action_is_pad is None:
-                raise ValueError("action_is_pad is required when supervise_padding_actions is False.")
-            action_is_pad = action_is_pad.to(device=inputs_embeds.device, dtype=torch.bool)
-            valid_action_mask = ~action_is_pad
-            if valid_action_mask.shape != action.shape[:2]:
-                raise ValueError(
-                    "action_is_pad must match the action time dimensions, "
-                    f"got {tuple(valid_action_mask.shape)} for action {tuple(action.shape[:2])}."
-                )
+
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * action
         u_t = noise - action
@@ -440,9 +422,11 @@ class EO1VisionFlowMatchingModel(nn.Module):
         action_time_embs = action_time_embs.to(inputs_embeds.device, inputs_embeds.dtype)
         inputs_embeds = inputs_embeds.masked_scatter(action_mask, action_time_embs)
 
-        # Cast the attention mask to the device of the inputs embeddings
-        attention_mask = attention_mask.to(inputs_embeds.device).clone()
-        if valid_action_mask is not None:
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(inputs_embeds.device)
+
+        if not self.config.supervise_padding_actions:
+            action_is_pad = action_is_pad.to(device=inputs_embeds.device, dtype=torch.bool)
             action_token_mask = action_mask[..., 0]
             action_padding_mask = torch.zeros_like(action_token_mask)
             action_padding_mask = action_padding_mask.masked_scatter(
@@ -490,19 +474,17 @@ class EO1VisionFlowMatchingModel(nn.Module):
                 return self.action_out_proj(action_hidden_states)
 
         v_t = self._apply_checkpoint(action_out_proj_func, action_hidden_states)
-        u_t = u_t.reshape(v_t.shape)
+        v_t = v_t.reshape(u_t.shape).to(dtype=u_t.dtype)
+        losses = F.mse_loss(u_t, v_t, reduction="none")
+
         if not self.config.supervise_padding_action_dims:
             original_action_dim = self.config.output_features[ACTION].shape[0]
-            u_t = u_t[:, :original_action_dim]
-            v_t = v_t[:, :original_action_dim]
-        v_t = v_t.to(dtype=u_t.dtype)
-        if valid_action_mask is not None:
-            losses = F.mse_loss(u_t, v_t, reduction="none")
-            fm_loss = losses[valid_action_mask.reshape(-1)].mean()
-        else:
-            fm_loss = F.mse_loss(u_t, v_t, reduction="mean")
+            losses = losses[..., :original_action_dim]
 
-        return fm_loss
+        if not self.config.supervise_padding_actions:
+            losses = losses[~action_is_pad]
+
+        return losses.mean()
 
     @torch.no_grad()
     def sample_actions(

@@ -279,8 +279,9 @@ class EO1VisionFlowMatchingModel(nn.Module):
         inputs_embeds: torch.FloatTensor | None,
         state_features: torch.FloatTensor | None = None,
         action_features: torch.FloatTensor | None = None,
-        state_token_id: int = 151669,
-        action_token_id: int = 151666,
+        *,
+        state_token_id: int,
+        action_token_id: int,
     ) -> tuple[torch.BoolTensor, torch.BoolTensor]:
         """Return EO1 state/action placeholder masks, following Qwen's multimodal mask style."""
         if input_ids is None:
@@ -322,7 +323,9 @@ class EO1VisionFlowMatchingModel(nn.Module):
         self,
         input_ids: torch.LongTensor,
         states: torch.Tensor,
+        *,
         state_token_id: int,
+        action_token_id: int,
     ) -> torch.FloatTensor:
         """Embed the EO1 prefix tokens before native Qwen injects multimodal features."""
 
@@ -344,6 +347,7 @@ class EO1VisionFlowMatchingModel(nn.Module):
             inputs_embeds,
             state_features=state_embs,
             state_token_id=state_token_id,
+            action_token_id=action_token_id,
         )
         state_embs = state_embs.to(inputs_embeds.device, inputs_embeds.dtype)
         inputs_embeds = inputs_embeds.masked_scatter(state_mask, state_embs)
@@ -393,19 +397,22 @@ class EO1VisionFlowMatchingModel(nn.Module):
         states: torch.FloatTensor | None = None,
         action: torch.FloatTensor | None = None,
         action_is_pad: torch.BoolTensor | None = None,
-        state_token_id: int = 151669,
-        action_token_id: int = 151666,
+        *,
+        state_token_id: int,
+        action_token_id: int,
         **kwargs,
     ) -> Tensor:
         """Run the EO1 training forward pass and compute the flow-matching loss."""
 
+        # 1. Build the EO1 prefix with state placeholders resolved.
         inputs_embeds = self.embed_prefix(
             input_ids,
             states=states,
             state_token_id=state_token_id,
+            action_token_id=action_token_id,
         )
 
-        # Scatter the action tokens into the inputs embeddings
+        # 2. Sample the diffusion target and replace the action placeholders.
         time = self.sample_time(action.shape[0], inputs_embeds.device)
         noise = self.sample_noise(action.shape, inputs_embeds.device)
 
@@ -417,11 +424,13 @@ class EO1VisionFlowMatchingModel(nn.Module):
             input_ids,
             inputs_embeds,
             action_features=action_time_embs,
+            state_token_id=state_token_id,
             action_token_id=action_token_id,
         )
         action_time_embs = action_time_embs.to(inputs_embeds.device, inputs_embeds.dtype)
         inputs_embeds = inputs_embeds.masked_scatter(action_mask, action_time_embs)
 
+        # 3. Optionally drop padded action tokens from backbone attention.
         if attention_mask is not None:
             attention_mask = attention_mask.to(inputs_embeds.device)
 
@@ -435,6 +444,7 @@ class EO1VisionFlowMatchingModel(nn.Module):
             )
             attention_mask = attention_mask.masked_fill(action_padding_mask, 0)
 
+        # 4. Run the Qwen backbone on the fused EO1 sequence.
         def vlm_forward_func(
             input_ids: torch.LongTensor,
             attention_mask: torch.Tensor | None,
@@ -467,7 +477,7 @@ class EO1VisionFlowMatchingModel(nn.Module):
         )
         action_hidden_states = hidden_states[action_mask[..., 0]]
 
-        # compute the flow-matching loss
+        # 5. Project the action-token hidden states back to the flow target space.
         def action_out_proj_func(action_hidden_states: torch.FloatTensor) -> torch.FloatTensor:
             with self.flow_head_autocast_context():
                 action_hidden_states = action_hidden_states.to(dtype=self.action_out_proj.dtype)
@@ -477,6 +487,7 @@ class EO1VisionFlowMatchingModel(nn.Module):
         v_t = v_t.reshape(u_t.shape).to(dtype=u_t.dtype)
         losses = F.mse_loss(u_t, v_t, reduction="none")
 
+        # 6. Apply the configured supervision mask and reduce the loss.
         if not self.config.supervise_padding_action_dims:
             original_action_dim = self.config.output_features[ACTION].shape[0]
             losses = losses[..., :original_action_dim]
@@ -495,8 +506,9 @@ class EO1VisionFlowMatchingModel(nn.Module):
         image_grid_thw: torch.LongTensor | None = None,
         mm_token_type_ids: torch.IntTensor | None = None,
         states: torch.Tensor | None = None,
-        state_token_id: int = 151669,
-        action_token_id: int = 151666,
+        *,
+        state_token_id: int,
+        action_token_id: int,
         **kwargs,
     ) -> Tensor:
         """Sample actions from the model."""
@@ -505,16 +517,19 @@ class EO1VisionFlowMatchingModel(nn.Module):
         if mm_token_type_ids is None:
             raise ValueError("mm_token_type_ids are required for EO1 action sampling.")
 
+        # 1. Resolve the left-padded rollout prompt and locate the action span.
         chunk_size = self.config.chunk_size
 
         inputs_embeds = self.embed_prefix(
             input_ids,
             states=states,
             state_token_id=state_token_id,
+            action_token_id=action_token_id,
         ).clone()
         _, action_placeholder_mask = self.get_placeholder_mask(
             input_ids,
             inputs_embeds,
+            state_token_id=state_token_id,
             action_token_id=action_token_id,
         )
         action_mask = action_placeholder_mask[..., 0]
@@ -533,6 +548,7 @@ class EO1VisionFlowMatchingModel(nn.Module):
             raise ValueError("Action tokens must form a contiguous chunk of length chunk_size.")
         act_slice = slice(act_start, act_end)
 
+        # 2. Encode the fixed prefix once and cache its KV state.
         batch_size = input_ids.shape[0]
         device = inputs_embeds.device
         attention_mask = attention_mask.to(device)
@@ -564,6 +580,7 @@ class EO1VisionFlowMatchingModel(nn.Module):
         dt = -1.0 / self.config.num_denoise_steps
         past_key_values = outputs.past_key_values
 
+        # 3. Denoise only the action chunk while keeping the prefix cache invariant.
         for step in range(self.config.num_denoise_steps):
             time = torch.full(
                 (batch_size,),

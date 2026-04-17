@@ -566,6 +566,7 @@ def test_eo1_embed_prefix_uses_manual_checkpointing(monkeypatch):
         input_ids=input_ids,
         states=states,
         state_token_id=11,
+        action_token_id=99,
     )
 
     assert inputs_embeds.shape == (1, input_ids.shape[1], config.text_config.hidden_size)

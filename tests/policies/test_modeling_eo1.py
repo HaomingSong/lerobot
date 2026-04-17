@@ -604,7 +604,7 @@ def test_eo1_padded_actions_follow_standard_diffusion_targets():
     )
 
 
-def test_eo1_can_leave_padded_actions_unnoised():
+def test_eo1_forward_drops_padded_actions_from_suffix_conditioning():
     config = make_test_config(dtype="bfloat16", supervise_padding_actions=False)
     model = EO1VisionFlowMatchingModel(config, DummyVLMBackbone(config.text_config.hidden_size))
 
@@ -630,16 +630,18 @@ def test_eo1_can_leave_padded_actions_unnoised():
 
     model.embed_suffix = fake_embed_suffix
     action_token_id = 7
+    input_ids = torch.cat(
+        [
+            torch.full((1, 1), 9, dtype=torch.long),
+            torch.full((1, config.chunk_size), action_token_id, dtype=torch.long),
+        ],
+        dim=1,
+    )
+    attention_mask = torch.ones(1, config.chunk_size + 1, dtype=torch.long)
 
     loss = model(
-        input_ids=torch.cat(
-            [
-                torch.full((1, 1), 9, dtype=torch.long),
-                torch.full((1, config.chunk_size), action_token_id, dtype=torch.long),
-            ],
-            dim=1,
-        ),
-        attention_mask=torch.ones(1, config.chunk_size + 1, dtype=torch.long),
+        input_ids=input_ids,
+        attention_mask=attention_mask,
         mm_token_type_ids=torch.zeros(1, config.chunk_size + 1, dtype=torch.int),
         states=torch.randn(1, config.max_state_dim, dtype=torch.float32),
         action=action,
@@ -648,13 +650,15 @@ def test_eo1_can_leave_padded_actions_unnoised():
         action_token_id=action_token_id,
     )
 
-    expected_noisy_actions = torch.full(
-        (1, config.chunk_size, config.max_action_dim), 2.0, dtype=torch.float32
-    )
-    expected_noisy_actions[:, config.chunk_size // 2 :] = 0.0
+    valid_steps = config.chunk_size // 2
+    expected_noisy_actions = torch.full((valid_steps, 1, config.max_action_dim), 2.0, dtype=torch.float32)
+    expected_attention_mask = attention_mask.clone()
+    expected_attention_mask[:, 1 + valid_steps :] = 0
+
     assert loss is not None
-    torch.testing.assert_close(captured["timestep"], torch.tensor([0.5], dtype=torch.float32))
+    torch.testing.assert_close(captured["timestep"], torch.full((valid_steps,), 0.5, dtype=torch.float32))
     torch.testing.assert_close(captured["noisy_actions"], expected_noisy_actions)
+    torch.testing.assert_close(model.vlm_backbone.model_calls[-1]["attention_mask"], expected_attention_mask)
 
 
 def test_eo1_flow_loss_ignores_padded_action_dimensions():
@@ -831,6 +835,41 @@ def test_eo1_flow_loss_can_ignore_padded_actions():
 
     assert loss is not None
     assert loss.item() == pytest.approx(1.0)
+
+
+def test_eo1_forward_returns_zero_loss_when_all_actions_are_padded():
+    config = make_test_config(dtype="bfloat16", supervise_padding_actions=False)
+    model = EO1VisionFlowMatchingModel(config, DummyVLMBackbone(config.text_config.hidden_size))
+
+    model.sample_time = lambda bsize, device: torch.full((bsize,), 0.5, dtype=torch.float32, device=device)
+    model.sample_noise = lambda shape, device: torch.zeros(shape, dtype=torch.float32, device=device)
+
+    def fail_embed_suffix(*args, **kwargs):
+        raise AssertionError("embed_suffix should not run when every action timestep is padded.")
+
+    model.embed_suffix = fail_embed_suffix
+
+    action_is_pad = torch.ones(1, config.chunk_size, dtype=torch.bool)
+    loss = model(
+        input_ids=torch.cat(
+            [
+                torch.full((1, 1), 9, dtype=torch.long),
+                torch.full((1, config.chunk_size), 7, dtype=torch.long),
+            ],
+            dim=1,
+        ),
+        attention_mask=torch.ones(1, config.chunk_size + 1, dtype=torch.long),
+        mm_token_type_ids=torch.zeros(1, config.chunk_size + 1, dtype=torch.int),
+        states=torch.randn(1, config.max_state_dim, dtype=torch.float32),
+        action=torch.zeros(1, config.chunk_size, config.max_action_dim, dtype=torch.float32),
+        action_is_pad=action_is_pad,
+        state_token_id=9,
+        action_token_id=7,
+    )
+
+    assert loss.dtype == torch.float32
+    assert loss.item() == pytest.approx(0.0)
+    assert model.vlm_backbone.model_calls == []
 
 
 def test_eo1_sample_actions_supports_batched_eval_denoising():

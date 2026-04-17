@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -131,6 +132,24 @@ class DummyVLMBackbone(nn.Module):
         return SimpleNamespace(
             last_hidden_state=inputs_embeds,
             past_key_values=SimpleNamespace(crop=lambda prefix_len: None),
+        )
+
+
+class ZeroActionOutProj(nn.Module):
+    def __init__(self, output_dim: int):
+        super().__init__()
+        self.output_dim = output_dim
+
+    @property
+    def dtype(self):
+        return torch.float32
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return torch.zeros(
+            hidden_states.shape[0],
+            self.output_dim,
+            dtype=torch.float32,
+            device=hidden_states.device,
         )
 
 
@@ -608,9 +627,11 @@ def test_eo1_forward_masks_padded_actions_from_backbone_attention():
     config = make_test_config(dtype="bfloat16", supervise_padding_actions=False)
     model = EO1VisionFlowMatchingModel(config, DummyVLMBackbone(config.text_config.hidden_size))
 
-    action = torch.zeros(1, config.chunk_size, config.max_action_dim, dtype=torch.float32)
-    action_is_pad = torch.zeros(1, config.chunk_size, dtype=torch.bool)
-    action_is_pad[:, config.chunk_size // 2 :] = True
+    batch_size = 2
+    action = torch.zeros(batch_size, config.chunk_size, config.max_action_dim, dtype=torch.float32)
+    action_is_pad = torch.zeros(batch_size, config.chunk_size, dtype=torch.bool)
+    action_is_pad[0, config.chunk_size // 2 :] = True
+    action_is_pad[1, -1:] = True
 
     model.sample_time = lambda bsize, device: torch.full((bsize,), 0.5, dtype=torch.float32, device=device)
     model.sample_noise = lambda shape, device: torch.full(shape, 4.0, dtype=torch.float32, device=device)
@@ -632,18 +653,18 @@ def test_eo1_forward_masks_padded_actions_from_backbone_attention():
     action_token_id = 7
     input_ids = torch.cat(
         [
-            torch.full((1, 1), 9, dtype=torch.long),
-            torch.full((1, config.chunk_size), action_token_id, dtype=torch.long),
+            torch.full((batch_size, 1), 9, dtype=torch.long),
+            torch.full((batch_size, config.chunk_size), action_token_id, dtype=torch.long),
         ],
         dim=1,
     )
-    attention_mask = torch.ones(1, config.chunk_size + 1, dtype=torch.long)
+    attention_mask = torch.ones(batch_size, config.chunk_size + 1, dtype=torch.long)
 
     loss = model(
         input_ids=input_ids,
         attention_mask=attention_mask,
-        mm_token_type_ids=torch.zeros(1, config.chunk_size + 1, dtype=torch.int),
-        states=torch.randn(1, config.max_state_dim, dtype=torch.float32),
+        mm_token_type_ids=torch.zeros(batch_size, config.chunk_size + 1, dtype=torch.int),
+        states=torch.randn(batch_size, config.max_state_dim, dtype=torch.float32),
         action=action,
         action_is_pad=action_is_pad,
         state_token_id=9,
@@ -651,14 +672,15 @@ def test_eo1_forward_masks_padded_actions_from_backbone_attention():
     )
 
     expected_noisy_actions = torch.full(
-        (1, config.chunk_size, config.max_action_dim), 2.0, dtype=torch.float32
+        (batch_size, config.chunk_size, config.max_action_dim), 2.0, dtype=torch.float32
     )
     expected_attention_mask = attention_mask.clone()
     valid_steps = config.chunk_size // 2
-    expected_attention_mask[:, 1 + valid_steps :] = 0
+    expected_attention_mask[0, 1 + valid_steps :] = 0
+    expected_attention_mask[1, -1:] = 0
 
     assert loss is not None
-    torch.testing.assert_close(captured["timestep"], torch.tensor([0.5], dtype=torch.float32))
+    torch.testing.assert_close(captured["timestep"], torch.full((batch_size,), 0.5, dtype=torch.float32))
     torch.testing.assert_close(captured["noisy_actions"], expected_noisy_actions)
     torch.testing.assert_close(model.vlm_backbone.model_calls[-1]["attention_mask"], expected_attention_mask)
 
@@ -837,6 +859,79 @@ def test_eo1_flow_loss_can_ignore_padded_actions():
 
     assert loss is not None
     assert loss.item() == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("supervise_padding_actions", [True, False])
+@pytest.mark.parametrize("supervise_padding_action_dims", [True, False])
+@pytest.mark.parametrize("use_autocast", [True, False])
+def test_eo1_forward_padding_switches_support_batched_amp_and_fp32(
+    supervise_padding_actions: bool,
+    supervise_padding_action_dims: bool,
+    use_autocast: bool,
+):
+    original_action_dim = 8
+    config = make_test_config(
+        dtype="bfloat16",
+        supervise_padding_actions=supervise_padding_actions,
+        supervise_padding_action_dims=supervise_padding_action_dims,
+        output_features={
+            ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(original_action_dim,)),
+        },
+    )
+    model = EO1VisionFlowMatchingModel(config, DummyVLMBackbone(config.text_config.hidden_size))
+
+    model.sample_time = lambda bsize, device: torch.full((bsize,), 0.5, dtype=torch.float32, device=device)
+    model.sample_noise = lambda shape, device: torch.zeros(shape, dtype=torch.float32, device=device)
+    model.embed_suffix = lambda timestep, noisy_actions: torch.zeros(
+        noisy_actions.shape[0],
+        noisy_actions.shape[1],
+        config.text_config.hidden_size,
+        dtype=torch.float32,
+        device=noisy_actions.device,
+    )
+    model.action_out_proj = ZeroActionOutProj(config.max_action_dim)
+
+    batch_size = 2
+    input_ids = torch.cat(
+        [
+            torch.full((batch_size, 1), 9, dtype=torch.long),
+            torch.full((batch_size, config.chunk_size), 7, dtype=torch.long),
+        ],
+        dim=1,
+    )
+    attention_mask = torch.ones(batch_size, config.chunk_size + 1, dtype=torch.long)
+    action_is_pad = torch.zeros(batch_size, config.chunk_size, dtype=torch.bool)
+    action_is_pad[0, config.chunk_size // 2 :] = True
+    action_is_pad[1, -1:] = True
+
+    action = torch.empty(batch_size, config.chunk_size, config.max_action_dim, dtype=torch.float32)
+    action[..., :original_action_dim] = 1.0
+    action[..., original_action_dim:] = 2.0
+    action[action_is_pad] = 3.0
+
+    autocast_context = (
+        torch.autocast(device_type="cpu", dtype=torch.bfloat16) if use_autocast else nullcontext()
+    )
+    with autocast_context:
+        loss = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            mm_token_type_ids=torch.zeros(batch_size, config.chunk_size + 1, dtype=torch.int),
+            states=torch.randn(batch_size, config.max_state_dim, dtype=torch.float32),
+            action=action,
+            action_is_pad=action_is_pad,
+            state_token_id=9,
+            action_token_id=7,
+        )
+
+    expected_losses = action.square()
+    if not supervise_padding_action_dims:
+        expected_losses = expected_losses[..., :original_action_dim]
+    if not supervise_padding_actions:
+        expected_losses = expected_losses[~action_is_pad]
+
+    assert loss.dtype == torch.float32
+    torch.testing.assert_close(loss, expected_losses.mean())
 
 
 def test_eo1_sample_actions_supports_batched_eval_denoising():

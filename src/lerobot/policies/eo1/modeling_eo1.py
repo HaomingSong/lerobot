@@ -563,6 +563,49 @@ class EO1VisionFlowMatchingModel(nn.Module):
         )
         position_ids = position_ids.to(device)
 
+        x_t = self.sample_noise(
+            (batch_size, chunk_size, self.config.max_action_dim),
+            device,
+        ).to(dtype=self.action_in_proj.weight.dtype)
+        dt = -1.0 / self.config.num_denoise_steps
+
+        has_left_padding = bool((attention_mask[:, 0] == 0).any().item())
+        if has_left_padding:
+            logger.warning_once(
+                "EO1 sample_actions detected left padding in a batched decode request; "
+                "falling back to full no-cache denoising because cached KV reuse is not "
+                "aligned with left-padded prefixes under the current Qwen2.5-VL attention APIs."
+            )
+            for step in range(self.config.num_denoise_steps):
+                time = torch.full(
+                    (batch_size,),
+                    1.0 + step * dt,
+                    device=device,
+                    dtype=torch.float32,
+                )
+                action_time_embs = self.embed_suffix(time, x_t)
+                inputs_embeds[:, act_slice] = action_time_embs.to(inputs_embeds.dtype)
+
+                outputs = self.vlm_backbone.model(
+                    input_ids=input_ids[:, :act_end],
+                    attention_mask=attention_mask[:, :act_end],
+                    position_ids=position_ids[..., :act_end],
+                    inputs_embeds=inputs_embeds[:, :act_end],
+                    pixel_values=pixel_values,
+                    image_grid_thw=image_grid_thw,
+                    mm_token_type_ids=mm_token_type_ids[:, :act_end],
+                    use_cache=False,
+                    return_dict=True,
+                )
+                with self.flow_head_autocast_context():
+                    hidden_states = outputs.last_hidden_state[:, act_slice]
+                    hidden_states = hidden_states.to(dtype=self.action_out_proj.dtype)
+                    v_t = self.action_out_proj(hidden_states)
+
+                x_t += dt * v_t.reshape(x_t.shape)
+
+            return x_t
+
         outputs = self.vlm_backbone.model(
             input_ids=input_ids[:, :act_start],
             attention_mask=attention_mask[:, :act_start],
@@ -574,12 +617,6 @@ class EO1VisionFlowMatchingModel(nn.Module):
             use_cache=True,
             return_dict=True,
         )
-
-        x_t = self.sample_noise(
-            (batch_size, chunk_size, self.config.max_action_dim),
-            device,
-        ).to(dtype=self.action_in_proj.weight.dtype)
-        dt = -1.0 / self.config.num_denoise_steps
         past_key_values = outputs.past_key_values
 
         for step in range(self.config.num_denoise_steps):

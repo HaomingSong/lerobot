@@ -383,29 +383,6 @@ class EO1VisionFlowMatchingModel(nn.Module):
         action_time_embs = self._apply_checkpoint(mlp_func, action_time_embs)
         return action_time_embs
 
-    def build_action_sequence_mask(
-        self,
-        action_placeholder_mask: torch.BoolTensor,
-        valid_action_mask: torch.BoolTensor,
-    ) -> torch.BoolTensor:
-        """Map per-timestep action validity to the matching action-token sequence positions."""
-        action_token_mask = action_placeholder_mask[..., 0]
-        token_counts = action_token_mask.sum(dim=1)
-        expected_tokens = valid_action_mask.shape[1]
-        torch_compilable_check(
-            bool(torch.all(token_counts == expected_tokens)),
-            (
-                "Each sample must contain exactly "
-                f"{expected_tokens} action tokens, got {token_counts.tolist()}."
-            ),
-        )
-
-        action_sequence_mask = torch.zeros_like(action_token_mask)
-        return action_sequence_mask.masked_scatter(
-            action_token_mask,
-            valid_action_mask.to(device=action_token_mask.device, dtype=torch.bool).reshape(-1),
-        )
-
     def forward(
         self,
         input_ids: torch.LongTensor | None = None,
@@ -443,7 +420,8 @@ class EO1VisionFlowMatchingModel(nn.Module):
         if not self.config.supervise_padding_actions:
             if action_is_pad is None:
                 raise ValueError("action_is_pad is required when supervise_padding_actions is False.")
-            valid_action_mask = ~action_is_pad.to(device=inputs_embeds.device, dtype=torch.bool)
+            action_is_pad = action_is_pad.to(device=inputs_embeds.device, dtype=torch.bool)
+            valid_action_mask = ~action_is_pad
             if valid_action_mask.shape != action.shape[:2]:
                 raise ValueError(
                     "action_is_pad must match the action time dimensions, "
@@ -452,43 +430,26 @@ class EO1VisionFlowMatchingModel(nn.Module):
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * action
         u_t = noise - action
-
-        # Cast the attention mask to the device of the inputs embeddings
-        attention_mask = attention_mask.to(inputs_embeds.device).clone()
-
+        action_time_embs = self.embed_suffix(time, x_t)
         _, action_mask = self.get_placeholder_mask(
             input_ids,
             inputs_embeds,
+            action_features=action_time_embs,
             action_token_id=action_token_id,
         )
-        action_token_mask = action_mask[..., 0]
+        action_time_embs = action_time_embs.to(inputs_embeds.device, inputs_embeds.dtype)
+        inputs_embeds = inputs_embeds.masked_scatter(action_mask, action_time_embs)
 
-        if valid_action_mask is None:
-            action_time_embs = self.embed_suffix(time, x_t)
-            self.get_placeholder_mask(
-                input_ids,
-                inputs_embeds,
-                action_features=action_time_embs,
-                action_token_id=action_token_id,
+        # Cast the attention mask to the device of the inputs embeddings
+        attention_mask = attention_mask.to(inputs_embeds.device).clone()
+        if valid_action_mask is not None:
+            action_token_mask = action_mask[..., 0]
+            action_padding_mask = torch.zeros_like(action_token_mask)
+            action_padding_mask = action_padding_mask.masked_scatter(
+                action_token_mask,
+                action_is_pad.reshape(-1),
             )
-            action_time_embs = action_time_embs.to(inputs_embeds.device, inputs_embeds.dtype)
-            inputs_embeds = inputs_embeds.masked_scatter(action_mask, action_time_embs)
-            action_loss_mask = action_token_mask
-            target_u_t = u_t.reshape(-1, self.config.max_action_dim)
-        else:
-            valid_action_sequence_mask = self.build_action_sequence_mask(action_mask, valid_action_mask)
-            attention_mask[action_token_mask & ~valid_action_sequence_mask] = 0
-            target_u_t = u_t[valid_action_mask]
-            action_loss_mask = valid_action_sequence_mask
-
-            if target_u_t.numel() == 0:
-                return torch.zeros((), dtype=torch.float32, device=inputs_embeds.device)
-
-            valid_timesteps = time[:, None].expand_as(valid_action_mask)[valid_action_mask]
-            valid_x_t = x_t[valid_action_mask][:, None, :]
-            valid_action_embs = self.embed_suffix(valid_timesteps, valid_x_t).squeeze(1)
-            valid_action_embs = valid_action_embs.to(inputs_embeds.device, inputs_embeds.dtype)
-            inputs_embeds[valid_action_sequence_mask] = valid_action_embs
+            attention_mask = attention_mask.masked_fill(action_padding_mask, 0)
 
         def vlm_forward_func(
             input_ids: torch.LongTensor,
@@ -520,7 +481,7 @@ class EO1VisionFlowMatchingModel(nn.Module):
             image_grid_thw,
             mm_token_type_ids,
         )
-        action_hidden_states = hidden_states[action_loss_mask]
+        action_hidden_states = hidden_states[action_mask[..., 0]]
 
         # compute the flow-matching loss
         def action_out_proj_func(action_hidden_states: torch.FloatTensor) -> torch.FloatTensor:
@@ -529,13 +490,17 @@ class EO1VisionFlowMatchingModel(nn.Module):
                 return self.action_out_proj(action_hidden_states)
 
         v_t = self._apply_checkpoint(action_out_proj_func, action_hidden_states)
-        u_t = target_u_t.reshape(v_t.shape)
+        u_t = u_t.reshape(v_t.shape)
         if not self.config.supervise_padding_action_dims:
             original_action_dim = self.config.output_features[ACTION].shape[0]
             u_t = u_t[:, :original_action_dim]
             v_t = v_t[:, :original_action_dim]
         v_t = v_t.to(dtype=u_t.dtype)
-        fm_loss = F.mse_loss(u_t, v_t, reduction="mean")
+        if valid_action_mask is not None:
+            losses = F.mse_loss(u_t, v_t, reduction="none")
+            fm_loss = losses[valid_action_mask.reshape(-1)].mean()
+        else:
+            fm_loss = F.mse_loss(u_t, v_t, reduction="mean")
 
         return fm_loss
 

@@ -448,7 +448,6 @@ class EO1VisionFlowMatchingModel(nn.Module):
                 pixel_values=pixel_values,
                 image_grid_thw=image_grid_thw,
                 mm_token_type_ids=mm_token_type_ids,
-                position_ids=None,
                 use_cache=False,
                 output_hidden_states=False,
                 return_dict=True,

@@ -46,6 +46,7 @@ from lerobot.utils.feature_utils import dataset_to_policy_features
 
 from .act.configuration_act import ACTConfig
 from .diffusion.configuration_diffusion import DiffusionConfig
+from .eo1.configuration_eo1 import EO1Config
 from .groot.configuration_groot import GrootConfig
 from .multi_task_dit.configuration_multi_task_dit import MultiTaskDiTConfig
 from .pi0.configuration_pi0 import PI0Config
@@ -156,6 +157,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from .wall_x.modeling_wall_x import WallXPolicy
 
         return WallXPolicy
+    elif name == "eo1":
+        from .eo1.modeling_eo1 import EO1Policy
+
+        return EO1Policy
     else:
         try:
             return _get_policy_cls_from_policy_name(name=name)
@@ -208,6 +213,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return XVLAConfig(**kwargs)
     elif policy_type == "wall_x":
         return WallXConfig(**kwargs)
+    elif policy_type == "eo1":
+        return EO1Config(**kwargs)
     else:
         try:
             config_cls = PreTrainedConfig.get_choice_class(policy_type)
@@ -424,6 +431,13 @@ def make_pre_post_processors(
         from .wall_x.processor_wall_x import make_wall_x_pre_post_processors
 
         processors = make_wall_x_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+    elif isinstance(policy_cfg, EO1Config):
+        from .eo1.processor_eo1 import make_eo1_pre_post_processors
+
+        processors = make_eo1_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )

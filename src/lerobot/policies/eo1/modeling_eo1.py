@@ -559,6 +559,7 @@ class EO1VisionFlowMatchingModel(nn.Module):
             action_time_embs = self.embed_suffix(time, x_t)
             inputs_embeds[:, act_slice] = action_time_embs.to(inputs_embeds.dtype)
 
+            past_key_values.crop(act_start)
             outputs = self.vlm_backbone.model(
                 position_ids=position_ids[..., act_slice],
                 attention_mask=attention_mask[:, :act_end],

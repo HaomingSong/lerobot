@@ -1,1 +1,1 @@
-../../../../docs/source/policy_eo1_README.md
+../../../../docs/source/eo1.mdx

@@ -20,12 +20,13 @@ it builds a chat prompt of the form
 <video>
 "The above video shows a robot manipulation trajectory that completes the
  following task: <instruction> Decide whether the above statement is True
- or not. The answer is: True"
+ or not. The answer is:"
+"True"
 ```
 
-forwards it through the VLM, label-masks everything except the very last token, and reads back the log-probability of that token — by default the literal `"True"` that closes the suffix template. The resulting `log P("True" | video + prompt + instruction)` is the reward.
+The processor appends the answer token, label-masks everything except that final token, and the model reads back the log-probability of the literal `"True"`. The resulting `log P("True" | video + prompt + instruction)` is the reward.
 
-Because the method only depends on a frozen VLM, TOPReward is **zero-shot**: there are no fine-tuned weights to host. The "model" in LeRobot is a small wrapper around `transformers`' `Qwen3VLForConditionalGeneration` plus the label-masking logic. The processor owns the tokeniser and builds the full chat prompt (EO-1/Robometer pattern).
+Because the method only depends on a frozen VLM, TOPReward is **zero-shot**: there are no fine-tuned weights to host. The "model" in LeRobot is a small wrapper around `transformers`' `Qwen3VLForConditionalGeneration`. The processor owns the tokeniser, builds the full chat prompt, and emits the label mask (EO-1/Robometer pattern).
 
 ## What the LeRobot integration covers
 
@@ -105,7 +106,7 @@ reward_model = make_reward_model(cfg)
 preprocessor, postprocessor = make_reward_pre_post_processors(cfg)
 ```
 
-The preprocessor tokenises the full prompt (video + prefix + instruction suffix), writes Qwen-VL tensors + `prompt_length` under `observation.topreward.*`. The model reads those tensors, label-masks based on `prompt_length`, and extracts the log-prob reward.
+The preprocessor tokenises the full prompt (video + prefix + instruction suffix), appends the answer token, and writes Qwen-VL tensors + `labels` under `observation.topreward.*`. The model reads those tensors and extracts the log-prob reward directly from the precomputed labels.
 
 ### Offline dataset labeling
 
@@ -137,10 +138,10 @@ The default prompt mirrors the upstream paper:
 
 ```text
 prompt_prefix = "The above video shows a robot manipulation trajectory that completes the following task: "
-prompt_suffix_template = "{instruction} Decide whether the above statement is True or not. The answer is: True"
+prompt_suffix_template = "{instruction} Decide whether the above statement is True or not. The answer is:"
 ```
 
-Both are exposed on `TOPRewardConfig` for ablation. The suffix template **must** contain `{instruction}`.
+Both are exposed on `TOPRewardConfig` for ablation. The suffix template **must** contain `{instruction}`; the processor appends the final `True` answer token.
 
 ### Chat template
 

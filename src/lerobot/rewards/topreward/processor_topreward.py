@@ -56,18 +56,19 @@ else:
 TOPREWARD_FEATURE_PREFIX = f"{OBS_PREFIX}topreward."
 
 _TRUE_ANSWER = "True"
+_QWEN_ASSISTANT_GENERATION_SUFFIX = "<|im_end|>\n<|im_start|>assistant\n"
 
 TOPREWARD_VLM_INPUT_KEYS = (
     "input_ids",
     "attention_mask",
+    "labels",
     "pixel_values",
     "pixel_values_videos",
     "image_grid_thw",
     "video_grid_thw",
     "second_per_grid_ts",
 )
-TOPREWARD_METADATA_KEYS = ("prompt_length",)
-TOPREWARD_INPUT_KEYS = TOPREWARD_VLM_INPUT_KEYS + TOPREWARD_METADATA_KEYS
+TOPREWARD_INPUT_KEYS = TOPREWARD_VLM_INPUT_KEYS
 
 
 def _video_to_numpy(video: Tensor, *, max_frames: int | None) -> np.ndarray:
@@ -119,10 +120,9 @@ class TOPRewardEncoderProcessorStep(ProcessorStep):
 
     Loads a :class:`~transformers.AutoProcessor` matching ``vlm_name`` and
     builds the full chat prompt including the instruction suffix. The
-    resulting ``input_ids``, ``attention_mask``, vision tensors, and a
-    per-sample ``prompt_length`` integer are written under the
-    ``observation.topreward.*`` namespace so the model can label-mask and
-    forward without re-tokenising.
+    resulting ``input_ids``, ``attention_mask``, label tensor, and vision
+    tensors are written under the ``observation.topreward.*`` namespace so
+    the model can forward without re-tokenising or rebuilding labels.
 
     At call time the step reads:
 
@@ -130,7 +130,7 @@ class TOPRewardEncoderProcessorStep(ProcessorStep):
     - ``complementary_data[task_key]``: a string or list of strings.
 
     and writes ``observation[f"{TOPREWARD_FEATURE_PREFIX}<name>"]`` for the
-    Qwen-VL tensors plus ``prompt_length``.
+    Qwen-VL tensors plus ``labels``.
     """
 
     vlm_name: str = "Qwen/Qwen3-VL-8B-Instruct"
@@ -189,110 +189,136 @@ class TOPRewardEncoderProcessorStep(ProcessorStep):
     def _encode_batch(self, tensor: Tensor, tasks: list[str]) -> dict[str, Any]:
         """Tokenise a batch of (frames, task) pairs into Qwen-VL tensors.
 
-        Processes samples one at a time (each may have a different token
-        length due to different numbers of vision patches), then pads /
-        stacks the results.
+        The chat messages are built per sample, but the Qwen processor is
+        called once for the full batch. Text tensors are left padded so the
+        final answer token is always at ``[:, -1]``; labels therefore mask
+        everything except that final token.
         """
-        from qwen_vl_utils import process_vision_info
+        templated_messages = []
 
-        batch_size = tensor.shape[0]
-        all_encoded: list[dict[str, Any]] = []
-        all_prompt_lengths: list[int] = []
-
-        for i in range(batch_size):
+        for i, task in enumerate(tasks):
             frames_np = _video_to_numpy(tensor[i], max_frames=self.max_frames)
             pil_frames = _frames_to_pil(frames_np)
-            task = tasks[i]
 
             instruction_suffix = self.prompt_suffix_template.format(instruction=task)
-            eos_token = self._processor.tokenizer.eos_token
-
-            if self.add_chat_template:
-                suffix_for_template = instruction_suffix.removesuffix(_TRUE_ANSWER).rstrip()
-                templated_messages = [
+            templated_messages.append(
+                [
                     {
                         "role": "user",
                         "content": [
                             {"type": "video", "video": pil_frames, "fps": self.fps},
-                            {"type": "text", "text": f"{self.prompt_prefix}{suffix_for_template}"},
+                            {"type": "text", "text": f"{self.prompt_prefix}{instruction_suffix}"},
                         ],
                     }
                 ]
-                prompt_chat = self._processor.apply_chat_template(
-                    templated_messages, tokenize=False, add_generation_prompt=True
-                )
-                full_text = f"{prompt_chat}{_TRUE_ANSWER}"
-                image_inputs, video_inputs = process_vision_info(templated_messages)
-            else:
-                user_messages = [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "video", "video": pil_frames, "fps": self.fps},
-                            {"type": "text", "text": self.prompt_prefix},
-                        ],
-                    }
-                ]
-                prompt_chat = self._processor.apply_chat_template(
-                    user_messages, tokenize=False, add_generation_prompt=False
-                )
-                if eos_token is not None:
-                    prompt_chat = prompt_chat.split(eos_token)[0]
-                full_text = f"{prompt_chat}{instruction_suffix}"
-                image_inputs, video_inputs = process_vision_info(user_messages)
-
-            inputs = self._processor(
-                text=[full_text],
-                images=image_inputs,
-                videos=video_inputs,
-                padding=True,
-                return_tensors="pt",
             )
 
-            input_len = int(inputs["input_ids"].shape[-1])
-            if input_len > self.max_length:
-                raise ValueError(
-                    f"TOPReward input length {input_len} exceeds max_length "
-                    f"{self.max_length}; lower `max_frames` or raise `max_length`."
-                )
+        # TODO: 这里把tokenizer拿出来设置padding side的方式太愚蠢了，apply_chat_template应该可以直接设置padding side=left，请你仔细查看
+        tokenizer = self._processor.tokenizer
+        original_padding_side = getattr(tokenizer, "padding_side", None)
+        if original_padding_side is not None:
+            tokenizer.padding_side = "left"
+        try:
+            encoded = self._processor.apply_chat_template(
+                templated_messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                padding=True,
+                return_tensors="pt",
+                return_dict=True,
+                return_mm_token_type_ids=True,  # TODO: 这里有必要显式添加吗？
+            )
+        finally:
+            if original_padding_side is not None:
+                tokenizer.padding_side = original_padding_side
 
-            prompt_length = input_len - 1
-            all_encoded.append(inputs)
-            all_prompt_lengths.append(prompt_length)
+        # NOTE: 这里为什么要手动转dict？不能直接用key或者.索引吗
+        result = dict(encoded)
+        if not self.add_chat_template:
+            trailer_token_ids = self._encode_one_or_more_tokens(_QWEN_ASSISTANT_GENERATION_SUFFIX)
+            result = self._remove_sequence_suffix(result, trailer_token_ids)
 
-        result = dict(all_encoded[0]) if batch_size == 1 else self._pad_and_stack(all_encoded)
+        answer_text = _TRUE_ANSWER if self.add_chat_template else f" {_TRUE_ANSWER}"
+        answer_token_id = self._encode_single_token(answer_text)
+        result = self._append_answer_token_and_labels(result, answer_token_id)
 
-        result["prompt_length"] = torch.tensor(all_prompt_lengths, dtype=torch.long)
+        input_len = int(result["input_ids"].shape[-1])
+        if input_len > self.max_length:
+            raise ValueError(
+                f"TOPReward input length {input_len} exceeds max_length "
+                f"{self.max_length}; lower `max_frames` or raise `max_length`."
+            )
+        return result
+
+    # TODO: 移除_encode_one_or_more_tokens与_encode_single_token，不需要异常诊断，调用tokenizer编码直接放在_encode_batch里面,
+    def _encode_one_or_more_tokens(self, text: str) -> torch.Tensor:
+        token_ids = self._processor.tokenizer.encode(text, add_special_tokens=False)
+        if not token_ids:
+            raise ValueError(f"TOPReward expected {text!r} to tokenize to at least one token")
+        # TODO: 请你确认能否直接让tokenizer return torch.long tensor，可以省略这里的转换步骤
+        return torch.tensor(token_ids, dtype=torch.long)
+
+    def _encode_single_token(self, text: str) -> int:
+        token_ids = self._processor.tokenizer.encode(text, add_special_tokens=False)
+        if len(token_ids) != 1:
+            raise ValueError(
+                f"TOPReward expected {text!r} to tokenize to one token, got token ids {token_ids}"
+            )
+        return int(token_ids[0])
+
+    @staticmethod
+    def _remove_sequence_suffix(encoded: dict[str, Any], suffix_token_ids: Tensor) -> dict[str, Any]:
+        input_ids = encoded["input_ids"]
+        suffix = suffix_token_ids.to(device=input_ids.device, dtype=input_ids.dtype)
+        suffix_len = int(suffix.numel())
+        if suffix_len >= input_ids.shape[-1]:
+            raise ValueError("TOPReward cannot remove the assistant generation prompt from an empty input")
+
+        actual_suffix = input_ids[:, -suffix_len:]
+        expected_suffix = suffix.unsqueeze(0).expand_as(actual_suffix)
+        if not torch.equal(actual_suffix, expected_suffix):
+            raise ValueError(
+                "TOPReward expected the Qwen chat template to end with "
+                f"{_QWEN_ASSISTANT_GENERATION_SUFFIX!r}, but the tokenized suffix did not match."
+            )
+
+        result: dict[str, Any] = {}
+        sequence_shape = input_ids.shape
+        for key, value in encoded.items():
+            if isinstance(value, Tensor) and value.shape == sequence_shape:
+                result[key] = value[:, :-suffix_len]
+            else:
+                result[key] = value
         return result
 
     @staticmethod
-    def _pad_and_stack(encoded_list: list[dict[str, Any]]) -> dict[str, Any]:
-        """Right-pad and stack per-sample encoded dicts into a batch."""
-        keys = [k for k in encoded_list[0] if isinstance(encoded_list[0][k], Tensor)]
-        max_len = max(enc["input_ids"].shape[-1] for enc in encoded_list)
+    def _append_answer_token_and_labels(encoded: dict[str, Any], answer_token_id: int) -> dict[str, Any]:
+        input_ids = encoded["input_ids"]
+        batch_size = input_ids.shape[0]
+        answer_ids = torch.full(
+            (batch_size, 1),
+            answer_token_id,
+            dtype=input_ids.dtype,
+            device=input_ids.device,
+        )
+
         result: dict[str, Any] = {}
-
-        for key in keys:
-            tensors = [enc[key] for enc in encoded_list]
-            if key in ("input_ids", "attention_mask"):
-                padded = []
-                pad_value = 0
-                for t in tensors:
-                    pad_size = max_len - t.shape[-1]
-                    if pad_size > 0:
-                        padded.append(torch.nn.functional.pad(t, (0, pad_size), value=pad_value))
-                    else:
-                        padded.append(t)
-                result[key] = torch.cat(padded, dim=0)
-            else:
-                if all(t.shape == tensors[0].shape for t in tensors):
-                    result[key] = torch.cat(tensors, dim=0)
+        sequence_shape = input_ids.shape
+        for key, value in encoded.items():
+            if isinstance(value, Tensor) and value.shape == sequence_shape:
+                if key == "input_ids":
+                    suffix = answer_ids
+                elif key == "attention_mask":
+                    suffix = torch.ones((batch_size, 1), dtype=value.dtype, device=value.device)
                 else:
-                    result[key] = torch.cat(tensors, dim=0)
+                    suffix = torch.zeros((batch_size, 1), dtype=value.dtype, device=value.device)
+                result[key] = torch.cat([value, suffix], dim=1)
+            else:
+                result[key] = value
 
-        for key in encoded_list[0]:
-            if key not in result:
-                result[key] = encoded_list[0][key]
+        labels = torch.full_like(result["input_ids"], -100)
+        labels[:, -1] = result["input_ids"][:, -1]
+        result["labels"] = labels
         return result
 
     def transform_features(
@@ -325,7 +351,7 @@ def make_topreward_pre_post_processors(
     """Pipeline that pre-encodes frames + task into Qwen-VL tensors.
 
     The preprocessor adds a batch dimension if needed, runs TOPReward's
-    encoder (which tokenises the full prompt and emits ``prompt_length``),
+    encoder (which tokenises the full prompt and emits ``labels``),
     and moves everything to the configured device. The postprocessor is
     the identity since TOPReward outputs a single reward tensor.
     """

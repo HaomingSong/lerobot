@@ -28,16 +28,16 @@ and returns that log-likelihood as the reward signal.
 
 Inference recipe:
 
-1. The processor builds a chat-style prompt, tokenises it, and emits
-   ``input_ids``, ``attention_mask``, vision tensors, and ``prompt_length``.
-2. The model label-masks everything before ``prompt_length`` with ``-100``.
-3. Forward the full token sequence through the VLM.
-4. Read per-token log-probabilities of the unmasked suffix tokens from the
+1. The processor builds a chat-style prompt, tokenises it, appends the
+   ``True`` answer token, and emits ``input_ids``, ``attention_mask``,
+   ``labels``, and vision tensors.
+2. Forward the full token sequence through the VLM.
+3. Read per-token log-probabilities of the unmasked label tokens from the
    logits and reduce them (mean or sum) into a scalar reward.
 
-With the default ``prompt_suffix_template`` and ``prompt_length = input_len - 1``
-(mirrored from upstream), the only unmasked token is the literal ``"True"``
-at the end — the reward is ``log P("True" | video + prompt + instruction)``.
+With the default ``prompt_suffix_template``, the only unmasked label is the
+literal ``"True"`` token at the end — the reward is
+``log P("True" | video + prompt + instruction)``.
 
 This LeRobot port is **inference-only and not trainable** — :meth:`forward`
 is intentionally inherited from :class:`PreTrainedRewardModel` and raises
@@ -128,15 +128,9 @@ class TOPRewardModel(PreTrainedRewardModel):
                 "TOPRewardEncoderProcessorStep ran before `compute_reward`."
             )
 
-        prompt_lengths = inputs.pop("prompt_length")
         device = next(self.model.parameters()).device
         inputs = {key: value.to(device) if hasattr(value, "to") else value for key, value in inputs.items()}
-
-        labels = inputs["input_ids"].clone()
-        for i, plen in enumerate(prompt_lengths.tolist()):
-            labels[i, : int(plen)] = -100
-        if "attention_mask" in inputs:
-            labels = labels.masked_fill(inputs["attention_mask"] == 0, -100)
+        labels = inputs.pop("labels")
 
         self.eval()
         with torch.no_grad():

@@ -51,7 +51,7 @@ class _FakeQwenModel(torch.nn.Module):
         logits = torch.zeros(batch_size, seq_len, vocab_size)
         # Place a controlled log-prob at the target token position so the
         # model returns a predictable reward value.
-        # The label-masked suffix is the last token (prompt_length = seq_len - 1).
+        # The processor masks every label except the final answer token.
         # After the causal-LM shift (logits[:, :-1], labels[:, 1:]) the scored
         # position is logits[:, -2, :] predicting labels[:, -1].
         # We set logits so that log_softmax at the target token ≈ _reward_value.
@@ -72,15 +72,21 @@ def _patch_build(monkeypatch) -> None:
 def _make_batch(
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor | None = None,
-    prompt_length: torch.Tensor | None = None,
+    labels: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Build a ``compute_reward``-ready batch using TOPReward's namespaced keys."""
     batch: dict[str, torch.Tensor] = {f"{TOPREWARD_FEATURE_PREFIX}input_ids": input_ids}
     if attention_mask is not None:
         batch[f"{TOPREWARD_FEATURE_PREFIX}attention_mask"] = attention_mask
-    if prompt_length is not None:
-        batch[f"{TOPREWARD_FEATURE_PREFIX}prompt_length"] = prompt_length
+    if labels is not None:
+        batch[f"{TOPREWARD_FEATURE_PREFIX}labels"] = labels
     return batch
+
+
+def _make_labels(input_ids: torch.Tensor) -> torch.Tensor:
+    labels = torch.full_like(input_ids, -100)
+    labels[:, -1] = input_ids[:, -1]
+    return labels
 
 
 # ---------------------------------------------------------------------------
@@ -142,9 +148,9 @@ def test_topreward_compute_reward_returns_one_scalar_per_sample(monkeypatch):
 
     input_ids = torch.randint(0, 100, (2, 10))
     attention_mask = torch.ones(2, 10, dtype=torch.long)
-    prompt_length = torch.tensor([9, 9])  # unmask only the last token
+    labels = _make_labels(input_ids)
 
-    batch = _make_batch(input_ids, attention_mask, prompt_length)
+    batch = _make_batch(input_ids, attention_mask, labels)
     rewards = model.compute_reward(batch)
 
     assert rewards.shape == (2,)
@@ -162,9 +168,9 @@ def test_topreward_compute_reward_applies_success_threshold(monkeypatch):
 
     input_ids = torch.randint(0, 100, (2, 10))
     attention_mask = torch.ones(2, 10, dtype=torch.long)
-    prompt_length = torch.tensor([9, 9])
+    labels = _make_labels(input_ids)
 
-    batch = _make_batch(input_ids, attention_mask, prompt_length)
+    batch = _make_batch(input_ids, attention_mask, labels)
     rewards = model.compute_reward(batch)
 
     assert rewards.shape == (2,)
@@ -181,6 +187,19 @@ def test_topreward_compute_reward_errors_when_inputs_missing(monkeypatch):
 
     with pytest.raises(KeyError, match=r"observation\.topreward\.input_ids"):
         model.compute_reward({})
+
+
+@skip_if_package_missing("transformers")
+def test_topreward_compute_reward_errors_when_labels_missing(monkeypatch):
+    from lerobot.rewards.topreward.modeling_topreward import TOPRewardModel
+
+    _patch_build(monkeypatch)
+    cfg = TOPRewardConfig(device="cpu")
+    model = TOPRewardModel(cfg)
+
+    input_ids = torch.randint(0, 100, (2, 10))
+    with pytest.raises(KeyError, match=r"observation\.topreward\.labels"):
+        model.compute_reward(_make_batch(input_ids))
 
 
 # ---------------------------------------------------------------------------

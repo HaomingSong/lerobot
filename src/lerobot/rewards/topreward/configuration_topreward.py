@@ -22,13 +22,13 @@ from lerobot.utils.constants import OBS_IMAGES
 
 # Default prompt scaffolding from the upstream TOPReward paper / reference
 # implementation (``QwenClient.compute_instruction_reward``). The prompt
-# computes the log-likelihood of the suffix ``f"{instruction} ... True"``
-# given the video, then reduces those token log-probs to a scalar reward.
+# computes the log-likelihood of the answer token ``True`` given the video,
+# instruction, and fixed question scaffold.
 DEFAULT_PROMPT_PREFIX = (
     "The above video shows a robot manipulation trajectory that completes the following task: "
 )
 DEFAULT_PROMPT_SUFFIX_TEMPLATE = (
-    "{instruction} Decide whether the above statement is True or not. The answer is: True"
+    "{instruction} Decide whether the above statement is True or not. The answer is:"
 )
 
 
@@ -62,8 +62,9 @@ class TOPRewardConfig(RewardModelConfig):
         prompt_prefix: Text shown to the VLM right after the video and
             before the suffix template.
         prompt_suffix_template: Suffix appended after ``prompt_prefix``.
-            Must contain ``{instruction}``; the VLM scores the
-            log-likelihood of the tokens that follow the prefix.
+            Must contain ``{instruction}``; the processor appends the
+            ``True`` answer token and builds labels that score only that
+            final token.
         add_chat_template: If ``True``, wrap the full prompt with the
             tokenizer's chat template before tokenisation (matches
             upstream ``add_chat_template=True``).

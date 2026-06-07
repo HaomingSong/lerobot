@@ -28,9 +28,9 @@ COSMOS3_WRIST_IMAGE = f"{OBS_IMAGES}.wrist_cam"
 
 COSMOS3_DROID_DOMAIN_ID = 8
 COSMOS3_CONCAT_VIEW_DESCRIPTION = (
-    "This video contains concatenated views from multiple camera perspectives. "
-    "The top half is a wrist-mounted camera view. The bottom half contains "
-    "left and right third-person shoulder camera views."
+    "The top row is from the wrist-mounted camera. "
+    "The bottom row contains two horizontally concatenated third-person perspective views of the scene from "
+    "opposite sides, with the robot visible."
 )
 
 

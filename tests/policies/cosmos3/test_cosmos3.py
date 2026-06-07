@@ -25,7 +25,10 @@ from lerobot.policies.cosmos3.configuration_cosmos3 import (
     COSMOS3_WRIST_IMAGE,
     Cosmos3Config,
 )
-from lerobot.policies.cosmos3.modeling_cosmos3 import Cosmos3Policy
+from lerobot.policies.cosmos3.modeling_cosmos3 import (
+    Cosmos3Policy,
+    _prepare_native_action_video_conditioning,
+)
 from lerobot.policies.cosmos3.processor_cosmos3 import (
     COSMOS3_ACTION_CONDITION,
     COSMOS3_ACTION_CONDITION_MASK,
@@ -103,6 +106,46 @@ def test_cosmos3_robolab_processor_packs_native_contract():
     torch.testing.assert_close(action_condition_mask[0, 0], torch.ones(1))
     assert torch.count_nonzero(action_condition_mask[0, 1:]) == 0
     assert processed[COSMOS3_PROMPT] == ["Pick up the banana and place it in the bowl."]
+
+
+def test_cosmos3_native_action_prompt_matches_robolab_string_transform():
+    policy = Cosmos3Policy(make_config())
+
+    prompt = policy.model._format_native_action_prompt(
+        "Pick up the banana and place it in the bowl.",
+        num_frames=33,
+        height=544,
+        width=736,
+        fps=15.0,
+    )
+
+    assert prompt == (
+        "Pick up the banana and place it in the bowl. "
+        "This video contains concatenated views from multiple camera perspectives. "
+        "The top row is from the wrist-mounted camera. "
+        "The bottom row contains two horizontally concatenated third-person perspective views of the scene from "
+        "opposite sides, with the robot visible. "
+        "The video is 2.0 seconds long and is of 15 FPS. "
+        "This video is of 544x736 resolution."
+    )
+
+
+def test_cosmos3_video_conditioning_matches_native_resize_contract():
+    video = torch.zeros(3, 33, 540, 640, dtype=torch.uint8)
+    video[:, 0] = torch.tensor([10, 20, 30], dtype=torch.uint8).view(3, 1, 1)
+
+    frames, image_size, height, width = _prepare_native_action_video_conditioning(
+        video,
+        resolution_tier=480,
+        num_frames=33,
+        device="cpu",
+        dtype=torch.float32,
+    )
+
+    assert frames.shape == (1, 3, 33, 544, 736)
+    torch.testing.assert_close(image_size, torch.tensor([544.0, 736.0, 540.0, 640.0]))
+    assert (height, width) == (544, 736)
+    torch.testing.assert_close(frames[0, :, 0, 0, 0], torch.tensor([10, 20, 30]) / 127.5 - 1.0)
 
 
 def test_cosmos3_select_action_uses_chunk_queue(monkeypatch):

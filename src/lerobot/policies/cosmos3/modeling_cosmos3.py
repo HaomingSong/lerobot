@@ -16,13 +16,15 @@
 
 from __future__ import annotations
 
-import copy
 from collections import deque
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F  # noqa: N812
+import torchvision.transforms.functional as transforms_functional
 from torch import Tensor, nn
+from torchvision.transforms import InterpolationMode
 
 from lerobot.utils.constants import ACTION
 from lerobot.utils.import_utils import require_package
@@ -76,6 +78,90 @@ def _get_3d_mrope_ids_action(
         h_index = h_index + int(temporal_offset)
         w_index = w_index + int(temporal_offset)
     return torch.stack([t_index, h_index, w_index], dim=0)
+
+
+def _arch_invariant_rand(
+    shape: tuple[int, ...],
+    *,
+    dtype: torch.dtype,
+    device: torch.device | str,
+    seed: int,
+) -> torch.Tensor:
+    random_array = np.random.RandomState(seed).standard_normal(shape).astype(np.float32)
+    return torch.from_numpy(random_array).to(dtype=dtype, device=device)
+
+
+def _prepare_native_action_video_conditioning(
+    video: Tensor,
+    *,
+    resolution_tier: int,
+    num_frames: int,
+    device: torch.device | str,
+    dtype: torch.dtype,
+) -> tuple[Tensor, Tensor, int, int]:
+    from diffusers.pipelines.cosmos.pipeline_cosmos3_omni import _ACTION_RESOLUTION_BINS
+    from diffusers.video_processor import VideoProcessor
+
+    if video.dtype != torch.uint8:
+        raise ValueError(f"Cosmos3 native video input must be uint8, got dtype={video.dtype}.")
+    if video.ndim != 4:
+        raise ValueError(f"Expected Cosmos3 native video shape [C,T,H,W], got shape={tuple(video.shape)}.")
+
+    frames = video.detach().cpu()
+    source_h, source_w = frames.shape[-2:]
+    resolution_key = str(resolution_tier)
+    if resolution_key not in _ACTION_RESOLUTION_BINS:
+        raise ValueError(
+            f"Unsupported action resolution_tier={resolution_tier!r}; "
+            f"expected one of {sorted(int(k) for k in _ACTION_RESOLUTION_BINS)}."
+        )
+    target_h, target_w = VideoProcessor.classify_height_width_bin(
+        source_h, source_w, ratios=_ACTION_RESOLUTION_BINS[resolution_key]
+    )
+
+    if frames.shape[1] < num_frames:
+        frames = torch.cat([frames, frames[:, -1:].expand(-1, num_frames - frames.shape[1], -1, -1)], dim=1)
+    else:
+        frames = frames[:, :num_frames]
+
+    _, _, frame_h, frame_w = frames.shape
+    scale = min(target_w / frame_w, target_h / frame_h, 1.0)
+    content_h = max(1, int(scale * frame_h + 0.5))
+    content_w = max(1, int(scale * frame_w + 0.5))
+
+    if content_h != frame_h or content_w != frame_w:
+        frames = transforms_functional.resize(
+            frames,
+            size=[content_h, content_w],
+            interpolation=InterpolationMode.BICUBIC,
+            antialias=True,
+        )
+    pad_right = target_w - content_w
+    pad_bottom = target_h - content_h
+    if pad_right or pad_bottom:
+        pad_mode = "replicate" if pad_right >= content_w or pad_bottom >= content_h else "reflect"
+        frames = F.pad(frames, (0, pad_right, 0, pad_bottom), mode=pad_mode)
+
+    image_size = torch.tensor([target_h, target_w, content_h, content_w], device=device, dtype=torch.float32)
+    frames = frames.unsqueeze(0).to(device=device, dtype=dtype) / 127.5 - 1.0
+    return frames, image_size, target_h, target_w
+
+
+_VIEWPOINT_TEMPLATES = {
+    "concat_view": "This video contains concatenated views from multiple camera perspectives.",
+    "ego_view": "This video is captured from a first-person perspective looking at the scene.",
+    "third_person_view": "This video is captured from a third-person perspective looking towards the agent from the front.",
+    "wrist_view": "This video is captured from a wrist-mounted camera.",
+}
+
+
+def _append_sentence(text: str, addition: str) -> str:
+    if not addition:
+        return text
+    if not text:
+        return addition
+    separator = " " if text.rstrip().endswith(".") else ". "
+    return text.rstrip() + separator + addition
 
 
 class Cosmos3Policy(PreTrainedPolicy):
@@ -255,15 +341,14 @@ class Cosmos3ActionModel(nn.Module):
         num_inference_steps = num_inference_steps or self.config.num_inference_steps
         guidance_scale = guidance_scale or self.config.guidance_scale
 
-        if generator is None:
-            generator = torch.Generator(device=device)
-            generator.manual_seed(self._next_seed() if seed is None else int(seed))
+        if generator is not None:
+            raise ValueError("Cosmos3 native action sampling uses integer seed=..., not torch.Generator.")
+        sample_seed = self._next_seed() if seed is None else int(seed)
 
-        image = video[:, 0].permute(1, 2, 0).detach().cpu().numpy()
-        vision_tensor, action_image_size, height, width = pipeline._prepare_action_video_conditioning(
-            [image],
-            self.config.resolution_tier,
-            self.config.chunk_size + 1,
+        vision_tensor, action_image_size, height, width = _prepare_native_action_video_conditioning(
+            video,
+            resolution_tier=self.config.resolution_tier,
+            num_frames=self.config.chunk_size + 1,
             device=device,
             dtype=dtype,
         )
@@ -278,11 +363,11 @@ class Cosmos3ActionModel(nn.Module):
             dtype=dtype,
         )
         vision_condition_mask[0, 0, 0] = 1.0
-        pure_noise = torch.randn(
+        pure_noise = _arch_invariant_rand(
             tuple(x0_tokens_vision.shape),
-            generator=generator,
-            device=device,
             dtype=dtype,
+            device=device,
+            seed=sample_seed,
         )
         latents = (
             vision_condition_mask * x0_tokens_vision.to(dtype=dtype)
@@ -299,11 +384,11 @@ class Cosmos3ActionModel(nn.Module):
             )
         action_condition = action_condition[:, :action_dim]
         action_condition_mask = action_condition_mask.to(device=device, dtype=dtype)
-        pure_action_noise = torch.randn(
+        pure_action_noise = _arch_invariant_rand(
             tuple(action_condition.shape),
-            generator=generator,
-            device=device,
             dtype=dtype,
+            device=device,
+            seed=sample_seed,
         )
         action_latents = (
             action_condition_mask * action_condition + (1.0 - action_condition_mask) * pure_action_noise
@@ -311,18 +396,12 @@ class Cosmos3ActionModel(nn.Module):
         action_latents[:, raw_action_dim_int:] = 0
         action_domain_id = domain_id.to(device=device, dtype=torch.long).view(1)
 
-        cond_input_ids, uncond_input_ids = pipeline.tokenize_prompt(
-            prompt,
-            None,
+        cond_input_ids, uncond_input_ids = self._tokenize_native_action_prompts(
+            prompt=prompt,
             num_frames=self.config.chunk_size + 1,
             height=height,
             width=width,
             fps=float(conditioning_fps.item()),
-            use_system_prompt=True,
-            add_resolution_template=True,
-            add_duration_template=True,
-            action_mode="policy",
-            action_view_point=self.config.viewpoint,
         )
         cond_text_segment = pipeline._prepare_text_segment(cond_input_ids, device=device)
         uncond_text_segment = pipeline._prepare_text_segment(uncond_input_ids, device=device)
@@ -345,16 +424,30 @@ class Cosmos3ActionModel(nn.Module):
             action_start_frame_offset=0 if self.config.use_state else 1,
         )
 
-        pipeline.scheduler.set_timesteps(num_inference_steps, device=device)
-        timesteps = pipeline.scheduler.timesteps
-        action_scheduler = copy.deepcopy(pipeline.scheduler)
+        scheduler = self._make_native_action_scheduler()
+        scheduler.set_timesteps(num_inference_steps, device=device)
+        timesteps = scheduler.timesteps
         pipeline._guidance_scale = guidance_scale
         pipeline._num_timesteps = len(timesteps)
 
+        vision_shape = tuple(latents.shape)
+        action_shape = tuple(action_latents.shape)
+        vision_size = latents.numel()
+
+        def pack_latents(vision: Tensor, action: Tensor) -> Tensor:
+            return torch.cat([vision.reshape(-1), action.reshape(-1)], dim=0)
+
+        def unpack_latents(flat_latents: Tensor) -> tuple[Tensor, Tensor]:
+            vision = flat_latents[:vision_size].reshape(vision_shape)
+            action = flat_latents[vision_size:].reshape(action_shape)
+            return vision, action
+
+        flat_latents = pack_latents(latents, action_latents)
         num_noisy_vision_tokens = cond_packed_static["num_noisy_vision_tokens"]
         action_noisy_len = cond_packed_static["num_noisy_action_tokens"]
         for t in timesteps:
             timestep = t.item()
+            latents, action_latents = unpack_latents(flat_latents)
             vision_tokens = latents.to(device=device, dtype=dtype)
             action_tokens = action_latents.to(device=device, dtype=dtype)
             vision_timesteps = torch.full((num_noisy_vision_tokens,), timestep, device=device)
@@ -389,13 +482,13 @@ class Cosmos3ActionModel(nn.Module):
                 velocity_vision = cond_v_vision
                 velocity_action = cond_v_action
 
-            latents = pipeline.scheduler.step(
-                velocity_vision.unsqueeze(0), t, latents.unsqueeze(0), return_dict=False
+            velocity = pack_latents(velocity_vision, velocity_action)
+            flat_latents = scheduler.step(
+                velocity.unsqueeze(0), t, flat_latents.unsqueeze(0), return_dict=False
             )[0].squeeze(0)
-            action_latents = action_scheduler.step(
-                velocity_action.unsqueeze(0), t, action_latents.unsqueeze(0), return_dict=False
-            )[0].squeeze(0)
+            latents, action_latents = unpack_latents(flat_latents)
             action_latents[:, raw_action_dim_int:] = 0
+            flat_latents = pack_latents(latents, action_latents)
 
         actions = action_latents[:, :raw_action_dim_int].detach().cpu().to(torch.float32)
         if self.config.history_length:
@@ -403,6 +496,59 @@ class Cosmos3ActionModel(nn.Module):
         if self.config.invert_gripper:
             actions[:, -1] = 1.0 - actions[:, -1]
         return actions[: self.config.chunk_size]
+
+    def _make_native_action_scheduler(self):
+        from diffusers import UniPCMultistepScheduler
+
+        return UniPCMultistepScheduler.from_config(
+            self.pipeline.scheduler.config,
+            use_karras_sigmas=False,
+            use_flow_sigmas=True,
+            flow_shift=float(self.config.shift),
+        )
+
+    def _format_native_action_prompt(
+        self, prompt: str, *, num_frames: int, height: int, width: int, fps: float
+    ) -> str:
+        caption = prompt.rstrip()
+        viewpoint_text = _VIEWPOINT_TEMPLATES.get(self.config.viewpoint)
+        if viewpoint_text is not None:
+            additional_view_description = self.config.additional_view_description.rstrip()
+            if additional_view_description:
+                viewpoint_text = _append_sentence(viewpoint_text, additional_view_description)
+            caption = _append_sentence(caption, viewpoint_text)
+
+        duration = int(num_frames / fps) if fps > 0 else 0
+        caption = _append_sentence(
+            caption, f"The video is {duration:.1f} seconds long and is of {fps:.0f} FPS."
+        )
+        caption = _append_sentence(caption, f"This video is of {height}x{width} resolution.")
+        return caption
+
+    def _tokenize_native_action_prompts(
+        self, *, prompt: str, num_frames: int, height: int, width: int, fps: float
+    ) -> tuple[list[int], list[int]]:
+        def tokenize(text: str) -> list[int]:
+            input_ids = self.pipeline.text_tokenizer.apply_chat_template(
+                [{"role": "user", "content": text}],
+                tokenize=True,
+                add_generation_prompt=True,
+                add_vision_id=False,
+                return_dict=False,
+            )
+            return list(input_ids) + [
+                self.pipeline.llm_special_tokens["eos_token_id"],
+                self.pipeline.llm_special_tokens["start_of_generation"],
+            ]
+
+        cond_text = self._format_native_action_prompt(
+            prompt,
+            num_frames=num_frames,
+            height=height,
+            width=width,
+            fps=fps,
+        )
+        return tokenize(cond_text), tokenize("")
 
     def _pack_static_segments(
         self,

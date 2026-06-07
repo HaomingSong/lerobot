@@ -76,8 +76,8 @@ class Cosmos3Config(PreTrainedConfig):
     guidance_scale: float = 3.0
     num_inference_steps: int = 4
     shift: float = 5.0
-    seed: int = 42
-    deterministic_seed: bool = True
+    seed: int = 0
+    deterministic_seed: bool = False
     generate_video: bool = False
     output_type: str = "latent"
 

@@ -20,6 +20,7 @@ import copy
 from collections import deque
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import torch
 from torch import Tensor, nn
 
@@ -94,6 +95,7 @@ class Cosmos3Policy(PreTrainedPolicy):
 
     def reset(self):
         self._action_queue = deque(maxlen=self.config.n_action_steps)
+        self.model.reset_generation()
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         loss, metrics = self.model.compute_loss(batch)
@@ -134,8 +136,17 @@ class Cosmos3ActionModel(nn.Module):
         self.config = config
         self.pipeline = pipeline
         self._empty = nn.Parameter(torch.empty(0), requires_grad=False)
+        self.reset_generation()
         if self.pipeline is None and config.load_diffusers_pipeline:
             self.pipeline = self._load_pipeline(config)
+
+    def reset_generation(self) -> None:
+        self._rng = np.random.default_rng(self.config.seed)
+
+    def _next_seed(self) -> int:
+        if self.config.deterministic_seed:
+            return int(self.config.seed)
+        return int(self._rng.integers(0, 2**31))
 
     def _load_pipeline(self, config: Cosmos3Config) -> Cosmos3OmniPipeline:
         require_package("diffusers", extra="cosmos3")
@@ -234,6 +245,7 @@ class Cosmos3ActionModel(nn.Module):
         conditioning_fps: Tensor,
         raw_action_dim: Tensor,
         generator: torch.Generator | None = None,
+        seed: int | None = None,
         num_inference_steps: int | None = None,
         guidance_scale: float | None = None,
     ) -> Tensor:
@@ -245,7 +257,7 @@ class Cosmos3ActionModel(nn.Module):
 
         if generator is None:
             generator = torch.Generator(device=device)
-            generator.manual_seed(self.config.seed)
+            generator.manual_seed(self._next_seed() if seed is None else int(seed))
 
         image = video[:, 0].permute(1, 2, 0).detach().cpu().numpy()
         vision_tensor, action_image_size, height, width = pipeline._prepare_action_video_conditioning(

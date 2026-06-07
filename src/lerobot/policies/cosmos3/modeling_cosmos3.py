@@ -148,6 +148,8 @@ class Cosmos3ActionModel(nn.Module):
         pipeline = Cosmos3OmniPipeline.from_pretrained(
             config.diffusers_model_name_or_path,
             torch_dtype=_torch_dtype(config.dtype),
+            safety_checker=None,
+            enable_safety_checker=config.enable_safety_checker,
         )
         if not config.enable_safety_checker and hasattr(pipeline, "safety_checker"):
             pipeline.safety_checker = None

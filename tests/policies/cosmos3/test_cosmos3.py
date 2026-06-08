@@ -298,15 +298,11 @@ def test_cosmos3_forward_uses_batched_training_loss(monkeypatch):
         assert kwargs["action_tokens"].shape[0] == batch_size
         return torch.zeros_like(kwargs["vision_tokens"]), torch.zeros_like(kwargs["action_tokens"])
 
-    def fail_single_velocity(**kwargs):
-        raise AssertionError("_predict_velocity should not be used by training forward")
-
     monkeypatch.setattr(
         cosmos3_modeling, "_prepare_native_action_video_conditioning_batch", fake_video_conditioning
     )
     monkeypatch.setattr(policy.model, "_encode_video", lambda video: video)
     monkeypatch.setattr(policy.model, "_predict_velocity_batch", fake_predict_velocity_batch)
-    monkeypatch.setattr(policy.model, "_predict_velocity", fail_single_velocity)
 
     batch = {
         COSMOS3_VIDEO: torch.zeros(batch_size, 3, sequence_length, 4, 4, dtype=torch.uint8),
@@ -323,11 +319,12 @@ def test_cosmos3_forward_uses_batched_training_loss(monkeypatch):
     loss, metrics = policy.model(batch)
 
     assert calls["batch"] == 1
+    assert not hasattr(policy.model, "_predict_velocity")
     assert loss.ndim == 0
     assert set(metrics) == {"loss", "flow_matching_loss_vision", "flow_matching_loss_action"}
 
 
-def test_cosmos3_batched_velocity_matches_single_sample_path():
+def test_cosmos3_batched_velocity_treats_single_sample_as_batch_case():
     cfg = make_config()
     cfg.dtype = "float32"
     cfg.eos_token_id = 5
@@ -335,51 +332,63 @@ def test_cosmos3_batched_velocity_matches_single_sample_path():
     policy = Cosmos3Policy(cfg)
     policy.eval()
 
-    cond_input_ids = torch.tensor([1, 2, 3], dtype=torch.long)
-    vision_tokens = torch.randn(1, 4, 2, 2, 2)
-    action_tokens = torch.randn(1, 3, cfg.max_action_dim)
-    text_segment = policy.model._prepare_text_segment(cond_input_ids, device="cpu")
-    packed_static = policy.model._pack_static_segments(
-        text_segment=text_segment,
-        latents=vision_tokens,
-        action_latents=action_tokens[0],
-        vision_condition_indexes=[0],
-        fps_vision=15.0,
-        action_start_frame_offset=0,
+    vision_tokens = torch.randn(2, 4, 2, 2, 2)
+    action_tokens = torch.randn(2, 3, cfg.max_action_dim)
+    cond_input_ids = [torch.tensor([1, 2, 3], dtype=torch.long), torch.tensor([1, 2], dtype=torch.long)]
+
+    single_packed_samples = policy.model._pack_batch_static(
+        cond_input_ids=[cond_input_ids[0]],
+        vision_tokens=vision_tokens[:1],
+        action_tokens=action_tokens[:1],
+        conditioning_fps=torch.tensor([15.0]),
     )
-    vision_timesteps = torch.full((packed_static["num_noisy_vision_tokens"],), 3.0)
-    action_timesteps = torch.full((packed_static["num_noisy_action_tokens"],), 3.0)
-    vision_condition_mask = torch.zeros((vision_tokens.shape[2], 1, 1))
-    vision_condition_mask[0] = 1.0
-    action_condition_mask = torch.zeros((action_tokens.shape[1], 1))
-    action_condition_mask[0] = 1.0
+    batch_packed_samples = policy.model._pack_batch_static(
+        cond_input_ids=cond_input_ids,
+        vision_tokens=vision_tokens,
+        action_tokens=action_tokens,
+        conditioning_fps=torch.tensor([15.0, 12.0]),
+    )
+    single_vision_timesteps = [
+        torch.full((sample["num_noisy_vision_tokens"],), 3.0) for sample in single_packed_samples
+    ]
+    single_action_timesteps = [
+        torch.full((sample["num_noisy_action_tokens"],), 3.0) for sample in single_packed_samples
+    ]
+    batch_vision_timesteps = [
+        torch.full((sample["num_noisy_vision_tokens"],), 3.0) for sample in batch_packed_samples
+    ]
+    batch_action_timesteps = [
+        torch.full((sample["num_noisy_action_tokens"],), 3.0) for sample in batch_packed_samples
+    ]
+    vision_condition_mask = torch.tensor([[[[[1.0]], [[0.0]]]]])
+    action_condition_mask = torch.tensor([[[1.0], [0.0], [0.0]], [[1.0], [0.0], [0.0]]])
 
     with torch.no_grad():
-        single_vision, single_action = policy.model._predict_velocity(
-            packed_static=packed_static,
-            vision_tokens=vision_tokens,
-            action_tokens=action_tokens[0],
-            vision_timesteps=vision_timesteps,
-            action_timesteps=action_timesteps,
-            action_domain_id=torch.tensor([cfg.domain_id]),
-            vision_condition_mask=vision_condition_mask,
-            action_condition_mask=action_condition_mask,
-            raw_action_dim=cfg.raw_action_dim,
-        )
-        batch_vision, batch_action = policy.model._predict_velocity_batch(
-            packed_samples=[packed_static],
-            vision_tokens=vision_tokens,
-            action_tokens=action_tokens,
-            vision_timesteps=[vision_timesteps],
-            action_timesteps=[action_timesteps],
+        single_vision, single_action = policy.model._predict_velocity_batch(
+            packed_samples=single_packed_samples,
+            vision_tokens=vision_tokens[:1],
+            action_tokens=action_tokens[:1],
+            vision_timesteps=single_vision_timesteps,
+            action_timesteps=single_action_timesteps,
             action_domain_ids=torch.tensor([cfg.domain_id]),
-            vision_condition_mask=vision_condition_mask.view(1, 1, vision_tokens.shape[2], 1, 1),
-            action_condition_mask=action_condition_mask.view(1, action_tokens.shape[1], 1),
+            vision_condition_mask=vision_condition_mask,
+            action_condition_mask=action_condition_mask[:1],
             raw_action_dims=torch.tensor([cfg.raw_action_dim]),
         )
+        batch_vision, batch_action = policy.model._predict_velocity_batch(
+            packed_samples=batch_packed_samples,
+            vision_tokens=vision_tokens,
+            action_tokens=action_tokens,
+            vision_timesteps=batch_vision_timesteps,
+            action_timesteps=batch_action_timesteps,
+            action_domain_ids=torch.tensor([cfg.domain_id, cfg.domain_id]),
+            vision_condition_mask=vision_condition_mask,
+            action_condition_mask=action_condition_mask,
+            raw_action_dims=torch.tensor([cfg.raw_action_dim, cfg.raw_action_dim]),
+        )
 
-    torch.testing.assert_close(batch_vision[0], single_vision)
-    torch.testing.assert_close(batch_action[0], single_action)
+    torch.testing.assert_close(batch_vision[:1], single_vision)
+    torch.testing.assert_close(batch_action[:1], single_action)
 
 
 def test_cosmos3_batched_velocity_supports_variable_text_lengths():
@@ -393,7 +402,7 @@ def test_cosmos3_batched_velocity_supports_variable_text_lengths():
     vision_tokens = torch.randn(2, 4, 2, 2, 2)
     action_tokens = torch.randn(2, 3, cfg.max_action_dim)
     cond_input_ids = [torch.tensor([1, 2]), torch.tensor([1, 2, 3, 4])]
-    packed_samples = policy.model._pack_training_batch_static(
+    packed_samples = policy.model._pack_batch_static(
         cond_input_ids=cond_input_ids,
         vision_tokens=vision_tokens,
         action_tokens=action_tokens,

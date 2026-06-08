@@ -570,7 +570,7 @@ class Cosmos3ActionModel(nn.Module):
 
         max_timestep = float(getattr(self.scheduler.config, "num_train_timesteps", 1000))
         timesteps = sigma.flatten() * max_timestep
-        packed_samples = self._pack_training_batch_static(
+        packed_samples = self._pack_batch_static(
             cond_input_ids=cond_input_ids,
             vision_tokens=noised_vision.to(dtype=dtype),
             action_tokens=noised_action.to(dtype=dtype),
@@ -688,24 +688,32 @@ class Cosmos3ActionModel(nn.Module):
         if videos.ndim == 4:
             videos = videos.unsqueeze(0)
         batch_size = videos.shape[0]
+        action_condition = batch[COSMOS3_ACTION_CONDITION]
+        if action_condition.ndim == 2:
+            action_condition = action_condition.unsqueeze(0)
+        action_condition_mask = batch[COSMOS3_ACTION_CONDITION_MASK]
+        if action_condition_mask.ndim == 2:
+            action_condition_mask = action_condition_mask.unsqueeze(0)
         seeds = self._normalise_sample_seeds(seed, batch_size)
-        actions = []
-        for batch_idx, sample_seed in enumerate(seeds):
-            action = self._sample_single(
-                cond_input_ids=self._get_ids_for_batch(batch[COSMOS3_COND_INPUT_IDS], batch_idx),
-                uncond_input_ids=self._get_ids_for_batch(batch[COSMOS3_UNCOND_INPUT_IDS], batch_idx),
-                video=videos[batch_idx],
-                action_condition=batch[COSMOS3_ACTION_CONDITION][batch_idx],
-                action_condition_mask=batch[COSMOS3_ACTION_CONDITION_MASK][batch_idx],
-                domain_id=batch[COSMOS3_ACTION_DOMAIN_ID][batch_idx],
-                conditioning_fps=batch[COSMOS3_CONDITIONING_FPS][batch_idx],
-                raw_action_dim=batch[COSMOS3_RAW_ACTION_DIM][batch_idx],
-                seed=sample_seed,
-                num_inference_steps=num_inference_steps,
-                guidance_scale=guidance_scale,
-            )
-            actions.append(action)
-        return torch.stack(actions, dim=0)
+        return self._sample_batch(
+            cond_input_ids=[
+                self._get_ids_for_batch(batch[COSMOS3_COND_INPUT_IDS], batch_idx)
+                for batch_idx in range(batch_size)
+            ],
+            uncond_input_ids=[
+                self._get_ids_for_batch(batch[COSMOS3_UNCOND_INPUT_IDS], batch_idx)
+                for batch_idx in range(batch_size)
+            ],
+            videos=videos,
+            action_condition=action_condition,
+            action_condition_mask=action_condition_mask,
+            domain_id=batch[COSMOS3_ACTION_DOMAIN_ID],
+            conditioning_fps=batch[COSMOS3_CONDITIONING_FPS],
+            raw_action_dim=batch[COSMOS3_RAW_ACTION_DIM],
+            seeds=seeds,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+        )
 
     @torch.no_grad()
     def predict_future_video(self, batch: dict[str, Tensor], **kwargs) -> Tensor | None:
@@ -726,28 +734,34 @@ class Cosmos3ActionModel(nn.Module):
             return [int(item) for item in seed]
         return [int(seed)] * batch_size
 
-    def _sample_single(
+    def _sample_batch(
         self,
         *,
-        cond_input_ids: Tensor,
-        uncond_input_ids: Tensor,
-        video: Tensor,
+        cond_input_ids: list[Tensor],
+        uncond_input_ids: list[Tensor],
+        videos: Tensor,
         action_condition: Tensor,
         action_condition_mask: Tensor,
         domain_id: Tensor,
         conditioning_fps: Tensor,
         raw_action_dim: Tensor,
-        seed: int,
+        seeds: list[int],
         num_inference_steps: int | None = None,
         guidance_scale: float | None = None,
     ) -> Tensor:
         device = _module_device(self.transformer)
         dtype = _module_dtype(self.transformer)
+        batch_size = videos.shape[0]
         num_inference_steps = num_inference_steps or self.config.num_inference_steps
         guidance_scale = guidance_scale if guidance_scale is not None else self.config.guidance_scale
+        raw_action_dims = torch.as_tensor(raw_action_dim, device=device, dtype=torch.long).view(batch_size)
+        conditioning_fps = torch.as_tensor(conditioning_fps, device=device, dtype=torch.float32).view(
+            batch_size
+        )
+        domain_id = torch.as_tensor(domain_id, device=device, dtype=torch.long).view(batch_size)
 
-        vision_tensor, action_image_size, _height, _width = _prepare_native_action_video_conditioning(
-            video,
+        vision_tensor, action_image_size, _height, _width = _prepare_native_action_video_conditioning_batch(
+            videos,
             resolution_tier=self.config.resolution_tier,
             num_frames=self.config.chunk_size + 1,
             device=device,
@@ -757,108 +771,119 @@ class Cosmos3ActionModel(nn.Module):
         x0_tokens_vision = self._remove_action_video_padding_from_latent(x0_tokens_vision, action_image_size)
 
         vision_condition_mask = torch.zeros(
-            (x0_tokens_vision.shape[2], 1, 1),
+            (1, 1, x0_tokens_vision.shape[2], 1, 1),
             device=device,
             dtype=dtype,
         )
-        vision_condition_mask[0, 0, 0] = 1.0
-        pure_noise = _arch_invariant_rand(
-            tuple(x0_tokens_vision.shape),
-            dtype=dtype,
-            device=device,
-            seed=seed,
+        vision_condition_mask[:, :, 0] = 1.0
+        pure_noise = torch.cat(
+            [
+                _arch_invariant_rand(
+                    tuple(x0_tokens_vision[batch_idx : batch_idx + 1].shape),
+                    dtype=dtype,
+                    device=device,
+                    seed=seeds[batch_idx],
+                )
+                for batch_idx in range(batch_size)
+            ],
+            dim=0,
         )
         latents = (
             vision_condition_mask * x0_tokens_vision.to(dtype=dtype)
             + (1.0 - vision_condition_mask) * pure_noise
         )
 
-        raw_action_dim_int = int(raw_action_dim.item())
         action_dim = int(self.transformer.config.action_dim)
         action_condition = action_condition.to(device=device, dtype=dtype)
         if action_condition.shape[-1] < action_dim:
             action_condition = F.pad(action_condition, (0, action_dim - action_condition.shape[-1]))
-        action_condition = action_condition[:, :action_dim]
+        action_condition = action_condition[:, :, :action_dim]
         action_condition_mask = action_condition_mask.to(device=device, dtype=dtype)
-        pure_action_noise = _arch_invariant_rand(
-            tuple(action_condition.shape),
-            dtype=dtype,
-            device=device,
-            seed=seed,
+        pure_action_noise = torch.stack(
+            [
+                _arch_invariant_rand(
+                    tuple(action_condition[batch_idx].shape),
+                    dtype=dtype,
+                    device=device,
+                    seed=seeds[batch_idx],
+                )
+                for batch_idx in range(batch_size)
+            ],
+            dim=0,
         )
         action_latents = (
             action_condition_mask * action_condition + (1.0 - action_condition_mask) * pure_action_noise
         )
-        action_latents[:, raw_action_dim_int:] = 0
-        action_domain_id = domain_id.to(device=device, dtype=torch.long).view(1)
+        action_dim_indexes = torch.arange(action_dim, device=device).view(1, 1, action_dim)
+        raw_action_mask = action_dim_indexes < raw_action_dims.view(batch_size, 1, 1)
+        action_latents = action_latents.masked_fill(~raw_action_mask, 0)
 
-        vision_condition_indexes = [0]
-        cond_packed_static = self._pack_static_segments(
-            text_segment=self._prepare_text_segment(cond_input_ids, device=device),
-            latents=latents,
-            action_latents=action_latents,
-            vision_condition_indexes=vision_condition_indexes,
-            fps_vision=float(conditioning_fps.item()),
-            action_start_frame_offset=0 if self.config.use_state else 1,
+        cond_packed_static = self._pack_batch_static(
+            cond_input_ids=cond_input_ids,
+            vision_tokens=latents,
+            action_tokens=action_latents,
+            conditioning_fps=conditioning_fps,
         )
-        uncond_packed_static = self._pack_static_segments(
-            text_segment=self._prepare_text_segment(uncond_input_ids, device=device),
-            latents=latents,
-            action_latents=action_latents,
-            vision_condition_indexes=vision_condition_indexes,
-            fps_vision=float(conditioning_fps.item()),
-            action_start_frame_offset=0 if self.config.use_state else 1,
+        uncond_packed_static = self._pack_batch_static(
+            cond_input_ids=uncond_input_ids,
+            vision_tokens=latents,
+            action_tokens=action_latents,
+            conditioning_fps=conditioning_fps,
         )
 
         scheduler = self.scheduler
         scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = scheduler.timesteps
 
-        vision_shape = tuple(latents.shape)
-        action_shape = tuple(action_latents.shape)
-        vision_size = latents.numel()
+        vision_shape = tuple(latents.shape[1:])
+        action_shape = tuple(action_latents.shape[1:])
+        vision_size = latents[0].numel()
 
         def pack_latents(vision: Tensor, action: Tensor) -> Tensor:
-            return torch.cat([vision.reshape(-1), action.reshape(-1)], dim=0)
+            return torch.cat([vision.reshape(batch_size, -1), action.reshape(batch_size, -1)], dim=1)
 
         def unpack_latents(flat_latents: Tensor) -> tuple[Tensor, Tensor]:
-            vision = flat_latents[:vision_size].reshape(vision_shape)
-            action = flat_latents[vision_size:].reshape(action_shape)
+            vision = flat_latents[:, :vision_size].reshape(batch_size, *vision_shape)
+            action = flat_latents[:, vision_size:].reshape(batch_size, *action_shape)
             return vision, action
 
         flat_latents = pack_latents(latents, action_latents)
-        num_noisy_vision_tokens = cond_packed_static["num_noisy_vision_tokens"]
-        action_noisy_len = cond_packed_static["num_noisy_action_tokens"]
         for timestep_tensor in timesteps:
             timestep = float(timestep_tensor.item())
             latents, action_latents = unpack_latents(flat_latents)
             vision_tokens = latents.to(device=device, dtype=dtype)
             action_tokens = action_latents.to(device=device, dtype=dtype)
-            vision_timesteps = torch.full((num_noisy_vision_tokens,), timestep, device=device)
-            action_timesteps = torch.full((action_noisy_len,), timestep, device=device)
+            vision_timesteps = [
+                torch.full((sample["num_noisy_vision_tokens"],), timestep, device=device)
+                for sample in cond_packed_static
+            ]
+            action_timesteps = [
+                torch.full((sample["num_noisy_action_tokens"],), timestep, device=device)
+                for sample in cond_packed_static
+            ]
 
-            cond_v_vision, cond_v_action = self._predict_velocity(
-                packed_static=cond_packed_static,
+            cond_v_vision, cond_v_action = self._predict_velocity_batch(
+                packed_samples=cond_packed_static,
                 vision_tokens=vision_tokens,
                 action_tokens=action_tokens,
                 vision_timesteps=vision_timesteps,
                 action_timesteps=action_timesteps,
-                action_domain_id=action_domain_id,
+                action_domain_ids=domain_id,
                 vision_condition_mask=vision_condition_mask,
                 action_condition_mask=action_condition_mask,
-                raw_action_dim=raw_action_dim_int,
+                raw_action_dims=raw_action_dims,
             )
             if guidance_scale != 1.0:
-                uncond_v_vision, uncond_v_action = self._predict_velocity(
-                    packed_static=uncond_packed_static,
+                uncond_v_vision, uncond_v_action = self._predict_velocity_batch(
+                    packed_samples=uncond_packed_static,
                     vision_tokens=vision_tokens,
                     action_tokens=action_tokens,
                     vision_timesteps=vision_timesteps,
                     action_timesteps=action_timesteps,
-                    action_domain_id=action_domain_id,
+                    action_domain_ids=domain_id,
                     vision_condition_mask=vision_condition_mask,
                     action_condition_mask=action_condition_mask,
-                    raw_action_dim=raw_action_dim_int,
+                    raw_action_dims=raw_action_dims,
                 )
                 velocity_vision = uncond_v_vision + guidance_scale * (cond_v_vision - uncond_v_vision)
                 velocity_action = uncond_v_action + guidance_scale * (cond_v_action - uncond_v_action)
@@ -867,19 +892,19 @@ class Cosmos3ActionModel(nn.Module):
                 velocity_action = cond_v_action
 
             velocity = pack_latents(velocity_vision, velocity_action)
-            flat_latents = scheduler.step(
-                velocity.unsqueeze(0), timestep_tensor, flat_latents.unsqueeze(0), return_dict=False
-            )[0].squeeze(0)
+            flat_latents = scheduler.step(velocity, timestep_tensor, flat_latents, return_dict=False)[0]
             latents, action_latents = unpack_latents(flat_latents)
-            action_latents[:, raw_action_dim_int:] = 0
+            action_latents = action_latents.masked_fill(~raw_action_mask, 0)
             flat_latents = pack_latents(latents, action_latents)
 
-        actions = action_latents[:, :raw_action_dim_int].detach().cpu().to(torch.float32)
+        output_action_dim = int(raw_action_dims.max().item())
+        actions = action_latents[:, :, :output_action_dim].detach().cpu().to(torch.float32)
         if self.config.history_length:
-            actions = actions[self.config.history_length :]
+            actions = actions[:, self.config.history_length :]
         if self.config.invert_gripper:
-            actions[:, -1] = 1.0 - actions[:, -1]
-        return actions[: self.config.chunk_size]
+            for batch_idx, raw_dim in enumerate(raw_action_dims.detach().cpu().tolist()):
+                actions[batch_idx, :, raw_dim - 1] = 1.0 - actions[batch_idx, :, raw_dim - 1]
+        return actions[:, : self.config.chunk_size]
 
     def _prepare_text_segment(self, input_ids: Tensor, device: torch.device | str) -> dict[str, Any]:
         input_ids = torch.as_tensor(input_ids, dtype=torch.long, device=device)
@@ -953,7 +978,7 @@ class Cosmos3ActionModel(nn.Module):
             + action_segment["action_len"],
         }
 
-    def _pack_training_batch_static(
+    def _pack_batch_static(
         self,
         *,
         cond_input_ids: list[Tensor],
@@ -1348,47 +1373,6 @@ class Cosmos3ActionModel(nn.Module):
     def _rotate_half(self, hidden_states: Tensor) -> Tensor:
         half = hidden_states.shape[-1] // 2
         return torch.cat((-hidden_states[..., half:], hidden_states[..., :half]), dim=-1)
-
-    def _predict_velocity(
-        self,
-        *,
-        packed_static: dict[str, Any],
-        vision_tokens: Tensor,
-        action_tokens: Tensor,
-        vision_timesteps: Tensor,
-        action_timesteps: Tensor,
-        action_domain_id: Tensor,
-        vision_condition_mask: Tensor,
-        action_condition_mask: Tensor,
-        raw_action_dim: int,
-    ) -> tuple[Tensor, Tensor]:
-        preds_vision, _preds_sound, preds_action = self.transformer(
-            input_ids=packed_static["input_ids"],
-            text_indexes=packed_static["text_indexes"],
-            position_ids=packed_static["position_ids"],
-            und_len=packed_static["und_len"],
-            sequence_length=packed_static["sequence_length"],
-            vision_tokens=[vision_tokens],
-            vision_token_shapes=packed_static["vision_token_shapes"],
-            vision_sequence_indexes=packed_static["vision_sequence_indexes"],
-            vision_mse_loss_indexes=packed_static["vision_mse_loss_indexes"],
-            vision_timesteps=vision_timesteps,
-            vision_noisy_frame_indexes=packed_static["vision_noisy_frame_indexes"],
-            action_tokens=[action_tokens],
-            action_token_shapes=packed_static["action_token_shapes"],
-            action_sequence_indexes=packed_static["action_sequence_indexes"],
-            action_mse_loss_indexes=packed_static["action_mse_loss_indexes"],
-            action_timesteps=action_timesteps,
-            action_noisy_frame_indexes=packed_static["action_noisy_frame_indexes"],
-            action_domain_ids=[action_domain_id],
-        )
-        if preds_action is None:
-            raise RuntimeError("Cosmos3 transformer did not return action velocity predictions.")
-
-        pred_vision = preds_vision[0] * (1.0 - vision_condition_mask).view(1, 1, -1, 1, 1)
-        pred_action = preds_action[0] * (1.0 - action_condition_mask)
-        pred_action[:, raw_action_dim:] = 0
-        return pred_vision.squeeze(0), pred_action
 
     def _format_native_action_prompt(
         self, prompt: str, *, num_frames: int, height: int, width: int, fps: float

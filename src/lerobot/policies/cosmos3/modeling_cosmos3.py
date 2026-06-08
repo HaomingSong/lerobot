@@ -205,6 +205,57 @@ def _prepare_native_action_video_conditioning(
     return frames, image_size, target_h, target_w
 
 
+def _prepare_native_action_video_conditioning_batch(
+    videos: Tensor,
+    *,
+    resolution_tier: int,
+    num_frames: int,
+    device: torch.device | str,
+    dtype: torch.dtype,
+) -> tuple[Tensor, Tensor, int, int]:
+    if videos.dtype != torch.uint8:
+        raise ValueError(f"Cosmos3 action video input must be uint8, got dtype={videos.dtype}.")
+    if videos.ndim != 5:
+        raise ValueError(f"Expected Cosmos3 action video shape [B,C,T,H,W], got shape={tuple(videos.shape)}.")
+
+    frames = videos.detach().to(device=device)
+    batch_size, channels, _time, source_h, source_w = frames.shape
+    target_h, target_w, content_h, content_w = classify_cosmos3_action_size(
+        source_h,
+        source_w,
+        resolution_tier=resolution_tier,
+    )
+
+    if frames.shape[2] < num_frames:
+        frames = torch.cat(
+            [frames, frames[:, :, -1:].expand(-1, -1, num_frames - frames.shape[2], -1, -1)],
+            dim=2,
+        )
+    else:
+        frames = frames[:, :, :num_frames]
+
+    frames_t = frames.permute(0, 2, 1, 3, 4).reshape(batch_size * num_frames, channels, source_h, source_w)
+    frames_t = frames_t.to(dtype=torch.float32)
+    if content_h != source_h or content_w != source_w:
+        frames_t = F.interpolate(
+            frames_t,
+            size=(content_h, content_w),
+            mode="bicubic",
+            align_corners=False,
+            antialias=True,
+        )
+    pad_right = target_w - content_w
+    pad_bottom = target_h - content_h
+    if pad_right or pad_bottom:
+        pad_mode = "replicate" if pad_right >= content_w or pad_bottom >= content_h else "reflect"
+        frames_t = F.pad(frames_t, (0, pad_right, 0, pad_bottom), mode=pad_mode)
+
+    frames = frames_t.reshape(batch_size, num_frames, channels, target_h, target_w)
+    frames = frames.permute(0, 2, 1, 3, 4).to(device=device, dtype=dtype) / 127.5 - 1.0
+    image_size = torch.tensor([target_h, target_w, content_h, content_w], device=device, dtype=torch.float32)
+    return frames, image_size, target_h, target_w
+
+
 class Cosmos3Policy(PreTrainedPolicy):
     """LeRobot policy wrapper for Cosmos3 DROID action generation."""
 
@@ -357,27 +408,24 @@ class Cosmos3ActionModel(nn.Module):
         clean_actions = self._prepare_clean_action_tokens(batch, action_conditions)
         sigmas = self._get_training_sigmas(batch, batch_size=batch_size)
 
-        losses = []
-        vision_losses = []
-        action_losses = []
-        for batch_idx in range(batch_size):
-            sample_losses = self._compute_single_training_loss(
-                cond_input_ids=self._get_ids_for_batch(batch[COSMOS3_COND_INPUT_IDS], batch_idx),
-                video=videos[batch_idx],
-                clean_action=clean_actions[batch_idx],
-                action_condition_mask=action_condition_masks[batch_idx],
-                domain_id=batch[COSMOS3_ACTION_DOMAIN_ID][batch_idx],
-                conditioning_fps=batch[COSMOS3_CONDITIONING_FPS][batch_idx],
-                raw_action_dim=batch[COSMOS3_RAW_ACTION_DIM][batch_idx],
-                sigma=sigmas[batch_idx],
-            )
-            losses.append(sample_losses["loss"])
-            vision_losses.append(sample_losses["flow_matching_loss_vision"])
-            action_losses.append(sample_losses["flow_matching_loss_action"])
+        cond_input_ids = [
+            self._get_ids_for_batch(batch[COSMOS3_COND_INPUT_IDS], batch_idx)
+            for batch_idx in range(batch_size)
+        ]
+        losses = self._compute_training_loss(
+            cond_input_ids=cond_input_ids,
+            videos=videos,
+            clean_action=clean_actions,
+            action_condition_mask=action_condition_masks,
+            domain_id=batch[COSMOS3_ACTION_DOMAIN_ID],
+            conditioning_fps=batch[COSMOS3_CONDITIONING_FPS],
+            raw_action_dim=batch[COSMOS3_RAW_ACTION_DIM],
+            sigma=sigmas,
+        )
 
-        loss = torch.stack(losses).mean()
-        vision_loss = torch.stack(vision_losses).mean()
-        action_loss = torch.stack(action_losses).mean()
+        loss = losses["loss"]
+        vision_loss = losses["flow_matching_loss_vision"]
+        action_loss = losses["flow_matching_loss_action"]
         metrics = {
             "loss": float(loss.detach().cpu()),
             "flow_matching_loss_vision": float(vision_loss.detach().cpu()),
@@ -461,11 +509,11 @@ class Cosmos3ActionModel(nn.Module):
         shift = float(self.config.shift)
         return shift * tau / (1.0 + (shift - 1.0) * tau)
 
-    def _compute_single_training_loss(
+    def _compute_training_loss(
         self,
         *,
-        cond_input_ids: Tensor,
-        video: Tensor,
+        cond_input_ids: list[Tensor],
+        videos: Tensor,
         clean_action: Tensor,
         action_condition_mask: Tensor,
         domain_id: Tensor,
@@ -475,10 +523,16 @@ class Cosmos3ActionModel(nn.Module):
     ) -> dict[str, Tensor]:
         device = _module_device(self.transformer)
         dtype = _module_dtype(self.transformer)
-        raw_action_dim_int = int(raw_action_dim.item())
+        batch_size = videos.shape[0]
+        raw_action_dims = torch.as_tensor(raw_action_dim, device=device, dtype=torch.long).view(batch_size)
+        conditioning_fps = torch.as_tensor(conditioning_fps, device=device, dtype=torch.float32).view(
+            batch_size
+        )
+        domain_id = torch.as_tensor(domain_id, device=device, dtype=torch.long).view(batch_size)
+        sigma = torch.as_tensor(sigma, device=device, dtype=torch.float32).view(batch_size, 1)
 
-        vision_tensor, action_image_size, _height, _width = _prepare_native_action_video_conditioning(
-            video,
+        vision_tensor, action_image_size, _height, _width = _prepare_native_action_video_conditioning_batch(
+            videos,
             resolution_tier=self.config.resolution_tier,
             num_frames=self.config.chunk_size + 1,
             device=device,
@@ -489,14 +543,13 @@ class Cosmos3ActionModel(nn.Module):
             clean_vision = self._remove_action_video_padding_from_latent(clean_vision, action_image_size)
 
         vision_condition_mask = torch.zeros(
-            (clean_vision.shape[2], 1, 1),
+            (1, 1, clean_vision.shape[2], 1, 1),
             device=device,
             dtype=torch.float32,
         )
-        vision_condition_mask[0, 0, 0] = 1.0
-        sigma = sigma.to(device=device, dtype=torch.float32).view(1, 1, 1, 1, 1)
-        vision_noisy_mask = 1.0 - vision_condition_mask.view(1, 1, clean_vision.shape[2], 1, 1)
-        vision_sigma = sigma * vision_noisy_mask
+        vision_condition_mask[:, :, 0] = 1.0
+        vision_noisy_mask = 1.0 - vision_condition_mask
+        vision_sigma = sigma.view(batch_size, 1, 1, 1, 1) * vision_noisy_mask
         epsilon_vision = torch.randn(clean_vision.shape, device=device, dtype=torch.float32)
         noised_vision = epsilon_vision * vision_sigma + clean_vision * (1.0 - vision_sigma)
         target_vision = epsilon_vision - clean_vision
@@ -505,65 +558,66 @@ class Cosmos3ActionModel(nn.Module):
         clean_action = clean_action.to(device=device, dtype=torch.float32)
         if clean_action.shape[-1] < action_dim:
             clean_action = F.pad(clean_action, (0, action_dim - clean_action.shape[-1]))
-        clean_action = clean_action[:, :action_dim]
+        clean_action = clean_action[:, :, :action_dim]
         action_condition_mask = action_condition_mask.to(device=device, dtype=torch.float32)
-        sigma_action = sigma.view(1, 1) * (1.0 - action_condition_mask)
+        sigma_action = sigma.view(batch_size, 1, 1) * (1.0 - action_condition_mask)
         epsilon_action = torch.randn(clean_action.shape, device=device, dtype=torch.float32)
         noised_action = epsilon_action * sigma_action + clean_action * (1.0 - sigma_action)
         target_action = epsilon_action - clean_action
-        noised_action[:, raw_action_dim_int:] = 0
-
-        text_segment = self._prepare_text_segment(cond_input_ids, device=device)
-        packed_static = self._pack_static_segments(
-            text_segment=text_segment,
-            latents=noised_vision.to(dtype=dtype),
-            action_latents=noised_action.to(dtype=dtype),
-            vision_condition_indexes=[0],
-            fps_vision=float(conditioning_fps.item()),
-            action_start_frame_offset=0 if self.config.use_state else 1,
-        )
+        action_dim_indexes = torch.arange(action_dim, device=device).view(1, 1, action_dim)
+        raw_action_mask = action_dim_indexes < raw_action_dims.view(batch_size, 1, 1)
+        noised_action = noised_action.masked_fill(~raw_action_mask, 0)
 
         max_timestep = float(getattr(self.scheduler.config, "num_train_timesteps", 1000))
-        timestep = sigma.flatten()[0] * max_timestep
-        vision_timesteps = torch.full(
-            (packed_static["num_noisy_vision_tokens"],),
-            float(timestep.item()),
-            device=device,
-            dtype=torch.float32,
+        timesteps = sigma.flatten() * max_timestep
+        packed_samples = self._pack_training_batch_static(
+            cond_input_ids=cond_input_ids,
+            vision_tokens=noised_vision.to(dtype=dtype),
+            action_tokens=noised_action.to(dtype=dtype),
+            conditioning_fps=conditioning_fps,
         )
-        action_timesteps = torch.full(
-            (packed_static["num_noisy_action_tokens"],),
-            float(timestep.item()),
-            device=device,
-            dtype=torch.float32,
-        )
-        action_domain_id = domain_id.to(device=device, dtype=torch.long).view(1)
+        vision_timesteps = [
+            torch.full(
+                (sample["num_noisy_vision_tokens"],),
+                float(timesteps[batch_idx].item()),
+                device=device,
+                dtype=torch.float32,
+            )
+            for batch_idx, sample in enumerate(packed_samples)
+        ]
+        action_timesteps = [
+            torch.full(
+                (sample["num_noisy_action_tokens"],),
+                float(timesteps[batch_idx].item()),
+                device=device,
+                dtype=torch.float32,
+            )
+            for batch_idx, sample in enumerate(packed_samples)
+        ]
 
-        pred_vision, pred_action = self._predict_velocity(
-            packed_static=packed_static,
+        pred_vision, pred_action = self._predict_velocity_batch(
+            packed_samples=packed_samples,
             vision_tokens=noised_vision.to(dtype=dtype),
             action_tokens=noised_action.to(dtype=dtype),
             vision_timesteps=vision_timesteps,
             action_timesteps=action_timesteps,
-            action_domain_id=action_domain_id,
+            action_domain_ids=domain_id,
             vision_condition_mask=vision_condition_mask.to(dtype=dtype),
             action_condition_mask=action_condition_mask.to(dtype=dtype),
-            raw_action_dim=raw_action_dim_int,
+            raw_action_dims=raw_action_dims,
         )
 
-        target_vision = target_vision[0].to(device=pred_vision.device, dtype=torch.float32)
-        vision_noisy_mask = vision_noisy_mask[0, 0].to(device=pred_vision.device, dtype=torch.float32)
-        vision_loss = self._masked_flow_matching_mse(
+        vision_loss = self._masked_flow_matching_mse_by_sample(
             pred_vision.to(dtype=torch.float32),
-            target_vision,
-            vision_noisy_mask,
+            target_vision.to(device=pred_vision.device, dtype=torch.float32),
+            vision_noisy_mask.to(device=pred_vision.device, dtype=torch.float32),
         )
 
-        action_noisy_mask = (1.0 - action_condition_mask).to(device=pred_action.device, dtype=torch.float32)
-        action_loss = self._masked_flow_matching_mse(
-            pred_action[:, :raw_action_dim_int].to(dtype=torch.float32),
-            target_action[:, :raw_action_dim_int].to(device=pred_action.device, dtype=torch.float32),
-            action_noisy_mask,
+        action_noisy_mask = (1.0 - action_condition_mask) * raw_action_mask
+        action_loss = self._masked_flow_matching_mse_by_sample(
+            pred_action.to(dtype=torch.float32),
+            target_action.to(device=pred_action.device, dtype=torch.float32),
+            action_noisy_mask.to(device=pred_action.device, dtype=torch.float32),
         )
         total_loss = (
             self.config.video_loss_weight * vision_loss + self.config.action_loss_weight * action_loss
@@ -582,6 +636,15 @@ class Cosmos3ActionModel(nn.Module):
 
         active_count = noisy_mask.expand_as(pred).sum()
         return sqerr.sum() / active_count.clamp_min(1.0)
+
+    def _masked_flow_matching_mse_by_sample(self, pred: Tensor, target: Tensor, noisy_mask: Tensor) -> Tensor:
+        noisy_mask = noisy_mask.to(device=pred.device, dtype=pred.dtype).expand_as(pred)
+        sqerr = (pred - target) ** 2 * noisy_mask
+        if not self.config.normalize_loss_by_active:
+            return sqerr.flatten(1).mean(dim=1).mean()
+
+        active_count = noisy_mask.flatten(1).sum(dim=1)
+        return (sqerr.flatten(1).sum(dim=1) / active_count.clamp_min(1.0)).mean()
 
     def _encode_video(self, video: Tensor) -> Tensor:
         vae_dtype = _module_dtype(self.vae)
@@ -890,6 +953,30 @@ class Cosmos3ActionModel(nn.Module):
             + action_segment["action_len"],
         }
 
+    def _pack_training_batch_static(
+        self,
+        *,
+        cond_input_ids: list[Tensor],
+        vision_tokens: Tensor,
+        action_tokens: Tensor,
+        conditioning_fps: Tensor,
+    ) -> list[dict[str, Any]]:
+        device = vision_tokens.device
+        packed_samples = []
+        for batch_idx, input_ids in enumerate(cond_input_ids):
+            text_segment = self._prepare_text_segment(input_ids, device=device)
+            packed_samples.append(
+                self._pack_static_segments(
+                    text_segment=text_segment,
+                    latents=vision_tokens[batch_idx : batch_idx + 1],
+                    action_latents=action_tokens[batch_idx],
+                    vision_condition_indexes=[0],
+                    fps_vision=float(conditioning_fps[batch_idx].item()),
+                    action_start_frame_offset=0 if self.config.use_state else 1,
+                )
+            )
+        return packed_samples
+
     def _prepare_vision_segment(
         self,
         *,
@@ -988,6 +1075,279 @@ class Cosmos3ActionModel(nn.Module):
             "action_len": action_len,
             "num_noisy_action_tokens": len(noisy_frame_indexes),
         }
+
+    def _predict_velocity_batch(
+        self,
+        *,
+        packed_samples: list[dict[str, Any]],
+        vision_tokens: Tensor,
+        action_tokens: Tensor,
+        vision_timesteps: list[Tensor],
+        action_timesteps: list[Tensor],
+        action_domain_ids: Tensor,
+        vision_condition_mask: Tensor,
+        action_condition_mask: Tensor,
+        raw_action_dims: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        transformer = self.transformer
+        batch_size = len(packed_samples)
+        device = vision_tokens.device
+        hidden_size = int(transformer.config.hidden_size)
+        max_und_len = max(sample["und_len"] for sample in packed_samples)
+        gen_lengths = [sample["sequence_length"] - sample["und_len"] for sample in packed_samples]
+        max_gen_len = max(gen_lengths)
+
+        all_input_ids = torch.cat([sample["input_ids"] for sample in packed_samples], dim=0)
+        all_text_embeddings = transformer.embed_tokens(all_input_ids)
+        target_dtype = all_text_embeddings.dtype
+        und_seq = all_text_embeddings.new_zeros((batch_size, max_und_len, hidden_size))
+        gen_seq = all_text_embeddings.new_zeros((batch_size, max_gen_len, hidden_size))
+        und_valid_mask = torch.zeros((batch_size, max_und_len), device=device, dtype=torch.bool)
+        gen_valid_mask = torch.zeros((batch_size, max_gen_len), device=device, dtype=torch.bool)
+
+        position_dtype = packed_samples[0]["position_ids"].dtype
+        position_ids_und = torch.zeros((3, batch_size, max_und_len), device=device, dtype=position_dtype)
+        position_ids_gen = torch.zeros((3, batch_size, max_gen_len), device=device, dtype=position_dtype)
+
+        text_offset = 0
+        for batch_idx, sample in enumerate(packed_samples):
+            und_len = sample["und_len"]
+            gen_len = gen_lengths[batch_idx]
+            und_seq[batch_idx, :und_len] = all_text_embeddings[text_offset : text_offset + und_len]
+            text_offset += und_len
+            und_valid_mask[batch_idx, :und_len] = True
+            gen_valid_mask[batch_idx, :gen_len] = True
+            position_ids = sample["position_ids"]
+            position_ids_und[:, batch_idx, :und_len] = position_ids[:, :und_len]
+            position_ids_gen[:, batch_idx, :gen_len] = position_ids[:, und_len : und_len + gen_len]
+
+        vision_token_list = [vision_tokens[batch_idx : batch_idx + 1] for batch_idx in range(batch_size)]
+        vision_token_shapes = [sample["vision_token_shapes"][0] for sample in packed_samples]
+        vision_noisy_frame_indexes = [sample["vision_noisy_frame_indexes"][0] for sample in packed_samples]
+        packed_vision_tokens, original_latent_shapes = transformer._patchify_and_pack_latents(
+            vision_token_list
+        )
+        packed_vision_tokens = transformer.proj_in(packed_vision_tokens)
+        packed_vision_timestep_embeds = transformer.time_embedder(
+            transformer.time_proj(torch.cat(vision_timesteps, dim=0) * transformer.config.timestep_scale)
+        ).to(target_dtype)
+        packed_vision_tokens = transformer._apply_timestep_embeds_to_noisy_tokens(
+            packed_tokens=packed_vision_tokens,
+            packed_timestep_embeds=packed_vision_timestep_embeds,
+            noisy_frame_indexes=vision_noisy_frame_indexes,
+            token_shapes=vision_token_shapes,
+        )
+
+        vision_token_offset = 0
+        for batch_idx, sample in enumerate(packed_samples):
+            token_count = sample["num_vision_tokens"]
+            gen_indexes = sample["vision_sequence_indexes"] - sample["und_len"]
+            gen_seq[batch_idx, gen_indexes] = packed_vision_tokens[
+                vision_token_offset : vision_token_offset + token_count
+            ]
+            vision_token_offset += token_count
+
+        action_token_list = [action_tokens[batch_idx] for batch_idx in range(batch_size)]
+        action_token_shapes = [sample["action_token_shapes"][0] for sample in packed_samples]
+        action_noisy_frame_indexes = [sample["action_noisy_frame_indexes"][0] for sample in packed_samples]
+        action_domain_id_list = [action_domain_ids[batch_idx].view(1) for batch_idx in range(batch_size)]
+        packed_action_tokens, per_token_domain_ids = transformer._pack_action_latents(
+            action_token_list, action_token_shapes, action_domain_id_list
+        )
+        packed_action_tokens = packed_action_tokens.to(target_dtype)
+        per_token_domain_ids = per_token_domain_ids.to(device=device)
+        packed_action_tokens = transformer.action_proj_in(packed_action_tokens, per_token_domain_ids)
+        packed_action_tokens = packed_action_tokens + transformer.action_modality_embed
+        packed_action_timestep_embeds = transformer.time_embedder(
+            transformer.time_proj(torch.cat(action_timesteps, dim=0) * transformer.config.timestep_scale)
+        ).to(target_dtype)
+        packed_action_tokens = transformer._apply_timestep_embeds_to_noisy_tokens(
+            packed_tokens=packed_action_tokens,
+            packed_timestep_embeds=packed_action_timestep_embeds,
+            noisy_frame_indexes=action_noisy_frame_indexes,
+            token_shapes=action_token_shapes,
+        )
+
+        action_token_offset = 0
+        for batch_idx, sample in enumerate(packed_samples):
+            token_count = sample["action_len"]
+            gen_indexes = sample["action_sequence_indexes"] - sample["und_len"]
+            gen_seq[batch_idx, gen_indexes] = packed_action_tokens[
+                action_token_offset : action_token_offset + token_count
+            ]
+            action_token_offset += token_count
+
+        cos_und, sin_und = transformer.rotary_emb(
+            position_ids=position_ids_und,
+            device=device,
+            dtype=target_dtype,
+        )
+        cos_gen, sin_gen = transformer.rotary_emb(
+            position_ids=position_ids_gen,
+            device=device,
+            dtype=target_dtype,
+        )
+        rotary_emb = (cos_und, sin_und, cos_gen, sin_gen)
+        und_seq = und_seq * und_valid_mask.unsqueeze(-1)
+        gen_seq = gen_seq * gen_valid_mask.unsqueeze(-1)
+
+        for decoder_layer in transformer.layers:
+            und_seq, gen_seq = self._batched_decoder_layer(
+                decoder_layer,
+                und_seq,
+                gen_seq,
+                rotary_emb,
+                und_valid_mask,
+                gen_valid_mask,
+            )
+
+        gen_out = transformer.norm_moe_gen(gen_seq) * gen_valid_mask.unsqueeze(-1)
+
+        vision_hidden_states = []
+        for batch_idx, sample in enumerate(packed_samples):
+            gen_indexes = sample["vision_mse_loss_indexes"] - sample["und_len"]
+            vision_hidden_states.append(gen_out[batch_idx, gen_indexes])
+        preds_vision_packed = transformer.proj_out(torch.cat(vision_hidden_states, dim=0))
+        preds_vision = transformer._unpatchify_and_unpack_latents(
+            preds_vision_packed,
+            token_shapes_vision=vision_token_shapes,
+            noisy_frame_indexes_vision=vision_noisy_frame_indexes,
+            original_latent_shapes=original_latent_shapes,
+        )
+        pred_vision = torch.cat(preds_vision, dim=0)
+
+        action_hidden_states = []
+        action_noisy_domain_ids = []
+        for batch_idx, sample in enumerate(packed_samples):
+            gen_indexes = sample["action_mse_loss_indexes"] - sample["und_len"]
+            action_hidden_states.append(gen_out[batch_idx, gen_indexes])
+            action_noisy_domain_ids.append(action_domain_ids[batch_idx].view(1).expand(len(gen_indexes)))
+        preds_action_packed = transformer.action_proj_out(
+            torch.cat(action_hidden_states, dim=0),
+            torch.cat(action_noisy_domain_ids, dim=0).to(device=device),
+        )
+        preds_action = transformer._unpack_action_latents(
+            preds_action_packed,
+            action_token_shapes,
+            action_noisy_frame_indexes,
+        )
+        pred_action = torch.stack(preds_action, dim=0)
+
+        pred_vision = pred_vision * (1.0 - vision_condition_mask).to(device=pred_vision.device)
+        pred_action = pred_action * (1.0 - action_condition_mask).to(device=pred_action.device)
+        action_dim_indexes = torch.arange(pred_action.shape[-1], device=pred_action.device).view(1, 1, -1)
+        raw_action_mask = action_dim_indexes < raw_action_dims.to(device=pred_action.device).view(
+            batch_size, 1, 1
+        )
+        pred_action = pred_action.masked_fill(~raw_action_mask, 0)
+        return pred_vision, pred_action
+
+    def _batched_decoder_layer(
+        self,
+        decoder_layer: nn.Module,
+        und_seq: Tensor,
+        gen_seq: Tensor,
+        rotary_emb: tuple[Tensor, Tensor, Tensor, Tensor],
+        und_valid_mask: Tensor,
+        gen_valid_mask: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        und_norm = decoder_layer.input_layernorm(und_seq)
+        gen_norm = decoder_layer.input_layernorm_moe_gen(gen_seq)
+
+        und_attn_out, gen_attn_out = self._batched_mot_attention(
+            decoder_layer.self_attn,
+            und_norm,
+            gen_norm,
+            rotary_emb,
+            und_valid_mask,
+            gen_valid_mask,
+        )
+        residual_und = (und_seq + und_attn_out) * und_valid_mask.unsqueeze(-1)
+        residual_gen = (gen_seq + gen_attn_out) * gen_valid_mask.unsqueeze(-1)
+
+        mlp_out_und = decoder_layer.mlp(decoder_layer.post_attention_layernorm(residual_und))
+        mlp_out_gen = decoder_layer.mlp_moe_gen(decoder_layer.post_attention_layernorm_moe_gen(residual_gen))
+        und_out = (residual_und + mlp_out_und) * und_valid_mask.unsqueeze(-1)
+        gen_out = (residual_gen + mlp_out_gen) * gen_valid_mask.unsqueeze(-1)
+        return und_out, gen_out
+
+    def _batched_mot_attention(
+        self,
+        attn: nn.Module,
+        und_seq: Tensor,
+        gen_seq: Tensor,
+        rotary_emb: tuple[Tensor, Tensor, Tensor, Tensor],
+        und_valid_mask: Tensor,
+        gen_valid_mask: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        batch_size, und_len, _hidden_size = und_seq.shape
+        gen_len = gen_seq.shape[1]
+
+        q_und = attn.to_q(und_seq).view(batch_size, und_len, attn.num_attention_heads, attn.head_dim)
+        k_und = attn.to_k(und_seq).view(batch_size, und_len, attn.num_key_value_heads, attn.head_dim)
+        v_und = attn.to_v(und_seq).view(batch_size, und_len, attn.num_key_value_heads, attn.head_dim)
+        q_gen = attn.add_q_proj(gen_seq).view(batch_size, gen_len, attn.num_attention_heads, attn.head_dim)
+        k_gen = attn.add_k_proj(gen_seq).view(batch_size, gen_len, attn.num_key_value_heads, attn.head_dim)
+        v_gen = attn.add_v_proj(gen_seq).view(batch_size, gen_len, attn.num_key_value_heads, attn.head_dim)
+
+        q_und = attn.norm_q(q_und)
+        k_und = attn.norm_k(k_und)
+        q_gen = attn.norm_added_q(q_gen)
+        k_gen = attn.norm_added_k(k_gen)
+
+        cos_und, sin_und, cos_gen, sin_gen = rotary_emb
+        q_und = q_und * cos_und.unsqueeze(2) + self._rotate_half(q_und) * sin_und.unsqueeze(2)
+        k_und = k_und * cos_und.unsqueeze(2) + self._rotate_half(k_und) * sin_und.unsqueeze(2)
+        q_gen = q_gen * cos_gen.unsqueeze(2) + self._rotate_half(q_gen) * sin_gen.unsqueeze(2)
+        k_gen = k_gen * cos_gen.unsqueeze(2) + self._rotate_half(k_gen) * sin_gen.unsqueeze(2)
+
+        q_und = q_und.transpose(1, 2)
+        k_und = self._repeat_kv_heads(k_und, attn.num_key_value_groups).transpose(1, 2)
+        v_und = self._repeat_kv_heads(v_und, attn.num_key_value_groups).transpose(1, 2)
+        q_gen = q_gen.transpose(1, 2)
+        k_gen = self._repeat_kv_heads(k_gen, attn.num_key_value_groups).transpose(1, 2)
+        v_gen = self._repeat_kv_heads(v_gen, attn.num_key_value_groups).transpose(1, 2)
+
+        causal_mask = torch.ones((und_len, und_len), device=und_seq.device, dtype=torch.bool).tril()
+        und_attn_mask = causal_mask.view(1, 1, und_len, und_len) & und_valid_mask.view(
+            batch_size, 1, 1, und_len
+        )
+        causal_out = F.scaled_dot_product_attention(
+            q_und,
+            k_und,
+            v_und,
+            attn_mask=und_attn_mask,
+            dropout_p=0.0,
+        )
+        causal_out = causal_out.transpose(1, 2).flatten(-2, -1)
+
+        all_k = torch.cat([k_und, k_gen], dim=2)
+        all_v = torch.cat([v_und, v_gen], dim=2)
+        all_valid_mask = torch.cat([und_valid_mask, gen_valid_mask], dim=1)
+        gen_attn_mask = all_valid_mask.view(batch_size, 1, 1, und_len + gen_len).expand(
+            batch_size, 1, gen_len, und_len + gen_len
+        )
+        full_out = F.scaled_dot_product_attention(
+            q_gen,
+            all_k,
+            all_v,
+            attn_mask=gen_attn_mask,
+            dropout_p=0.0,
+        )
+        full_out = full_out.transpose(1, 2).flatten(-2, -1)
+
+        und_out = attn.to_out(causal_out) * und_valid_mask.unsqueeze(-1)
+        gen_out = attn.to_add_out(full_out) * gen_valid_mask.unsqueeze(-1)
+        return und_out, gen_out
+
+    def _repeat_kv_heads(self, hidden_states: Tensor, num_key_value_groups: int) -> Tensor:
+        if num_key_value_groups == 1:
+            return hidden_states
+        return hidden_states.repeat_interleave(num_key_value_groups, dim=2)
+
+    def _rotate_half(self, hidden_states: Tensor) -> Tensor:
+        half = hidden_states.shape[-1] // 2
+        return torch.cat((-hidden_states[..., half:], hidden_states[..., :half]), dim=-1)
 
     def _predict_velocity(
         self,

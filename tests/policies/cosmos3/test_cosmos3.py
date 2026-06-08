@@ -19,6 +19,7 @@ from __future__ import annotations
 import torch
 
 from lerobot.configs import FeatureType, PolicyFeature
+from lerobot.policies.cosmos3 import modeling_cosmos3 as cosmos3_modeling
 from lerobot.policies.cosmos3.configuration_cosmos3 import (
     COSMOS3_LEFT_IMAGE,
     COSMOS3_RIGHT_IMAGE,
@@ -32,9 +33,14 @@ from lerobot.policies.cosmos3.modeling_cosmos3 import (
 from lerobot.policies.cosmos3.processor_cosmos3 import (
     COSMOS3_ACTION_CONDITION,
     COSMOS3_ACTION_CONDITION_MASK,
+    COSMOS3_ACTION_DOMAIN_ID,
     COSMOS3_CLEAN_ACTION,
     COSMOS3_COMPOSED_IMAGE,
+    COSMOS3_COND_INPUT_IDS,
+    COSMOS3_CONDITIONING_FPS,
     COSMOS3_PROMPT,
+    COSMOS3_RAW_ACTION_DIM,
+    COSMOS3_TRAINING_SIGMA,
     COSMOS3_VIDEO,
     make_cosmos3_pre_post_processors,
 )
@@ -269,3 +275,145 @@ def test_cosmos3_masked_flow_matching_mse_matches_native_denominator():
         policy.model._masked_flow_matching_mse(pred, target, noisy_mask),
         torch.tensor(5.0),
     )
+
+
+def test_cosmos3_forward_uses_batched_training_loss(monkeypatch):
+    cfg = make_config()
+    cfg.dtype = "float32"
+    cfg.eos_token_id = 5
+    cfg.start_of_generation_token_id = 6
+    policy = Cosmos3Policy(cfg)
+    batch_size = 2
+    sequence_length = 3
+    clean_vision = torch.zeros(batch_size, 4, 2, 2, 2)
+    calls = {"batch": 0}
+
+    def fake_video_conditioning(videos, **kwargs):
+        return clean_vision, torch.tensor([2.0, 2.0, 2.0, 2.0]), 2, 2
+
+    def fake_predict_velocity_batch(**kwargs):
+        calls["batch"] += 1
+        assert len(kwargs["packed_samples"]) == batch_size
+        assert kwargs["vision_tokens"].shape[0] == batch_size
+        assert kwargs["action_tokens"].shape[0] == batch_size
+        return torch.zeros_like(kwargs["vision_tokens"]), torch.zeros_like(kwargs["action_tokens"])
+
+    def fail_single_velocity(**kwargs):
+        raise AssertionError("_predict_velocity should not be used by training forward")
+
+    monkeypatch.setattr(
+        cosmos3_modeling, "_prepare_native_action_video_conditioning_batch", fake_video_conditioning
+    )
+    monkeypatch.setattr(policy.model, "_encode_video", lambda video: video)
+    monkeypatch.setattr(policy.model, "_predict_velocity_batch", fake_predict_velocity_batch)
+    monkeypatch.setattr(policy.model, "_predict_velocity", fail_single_velocity)
+
+    batch = {
+        COSMOS3_VIDEO: torch.zeros(batch_size, 3, sequence_length, 4, 4, dtype=torch.uint8),
+        COSMOS3_ACTION_CONDITION: torch.zeros(batch_size, sequence_length, cfg.raw_action_dim),
+        COSMOS3_ACTION_CONDITION_MASK: torch.tensor([[[1.0], [0.0], [0.0]]] * batch_size),
+        COSMOS3_ACTION_DOMAIN_ID: torch.full((batch_size,), cfg.domain_id),
+        COSMOS3_CONDITIONING_FPS: torch.full((batch_size,), 15.0),
+        COSMOS3_RAW_ACTION_DIM: torch.full((batch_size,), cfg.raw_action_dim),
+        COSMOS3_COND_INPUT_IDS: [torch.tensor([1, 2]), torch.tensor([1, 2, 3])],
+        COSMOS3_CLEAN_ACTION: torch.zeros(batch_size, sequence_length, cfg.max_action_dim),
+        COSMOS3_TRAINING_SIGMA: torch.full((batch_size, 1), 0.5),
+    }
+
+    loss, metrics = policy.model(batch)
+
+    assert calls["batch"] == 1
+    assert loss.ndim == 0
+    assert set(metrics) == {"loss", "flow_matching_loss_vision", "flow_matching_loss_action"}
+
+
+def test_cosmos3_batched_velocity_matches_single_sample_path():
+    cfg = make_config()
+    cfg.dtype = "float32"
+    cfg.eos_token_id = 5
+    cfg.start_of_generation_token_id = 6
+    policy = Cosmos3Policy(cfg)
+    policy.eval()
+
+    cond_input_ids = torch.tensor([1, 2, 3], dtype=torch.long)
+    vision_tokens = torch.randn(1, 4, 2, 2, 2)
+    action_tokens = torch.randn(1, 3, cfg.max_action_dim)
+    text_segment = policy.model._prepare_text_segment(cond_input_ids, device="cpu")
+    packed_static = policy.model._pack_static_segments(
+        text_segment=text_segment,
+        latents=vision_tokens,
+        action_latents=action_tokens[0],
+        vision_condition_indexes=[0],
+        fps_vision=15.0,
+        action_start_frame_offset=0,
+    )
+    vision_timesteps = torch.full((packed_static["num_noisy_vision_tokens"],), 3.0)
+    action_timesteps = torch.full((packed_static["num_noisy_action_tokens"],), 3.0)
+    vision_condition_mask = torch.zeros((vision_tokens.shape[2], 1, 1))
+    vision_condition_mask[0] = 1.0
+    action_condition_mask = torch.zeros((action_tokens.shape[1], 1))
+    action_condition_mask[0] = 1.0
+
+    with torch.no_grad():
+        single_vision, single_action = policy.model._predict_velocity(
+            packed_static=packed_static,
+            vision_tokens=vision_tokens,
+            action_tokens=action_tokens[0],
+            vision_timesteps=vision_timesteps,
+            action_timesteps=action_timesteps,
+            action_domain_id=torch.tensor([cfg.domain_id]),
+            vision_condition_mask=vision_condition_mask,
+            action_condition_mask=action_condition_mask,
+            raw_action_dim=cfg.raw_action_dim,
+        )
+        batch_vision, batch_action = policy.model._predict_velocity_batch(
+            packed_samples=[packed_static],
+            vision_tokens=vision_tokens,
+            action_tokens=action_tokens,
+            vision_timesteps=[vision_timesteps],
+            action_timesteps=[action_timesteps],
+            action_domain_ids=torch.tensor([cfg.domain_id]),
+            vision_condition_mask=vision_condition_mask.view(1, 1, vision_tokens.shape[2], 1, 1),
+            action_condition_mask=action_condition_mask.view(1, action_tokens.shape[1], 1),
+            raw_action_dims=torch.tensor([cfg.raw_action_dim]),
+        )
+
+    torch.testing.assert_close(batch_vision[0], single_vision)
+    torch.testing.assert_close(batch_action[0], single_action)
+
+
+def test_cosmos3_batched_velocity_supports_variable_text_lengths():
+    cfg = make_config()
+    cfg.dtype = "float32"
+    cfg.eos_token_id = 5
+    cfg.start_of_generation_token_id = 6
+    policy = Cosmos3Policy(cfg)
+    policy.eval()
+
+    vision_tokens = torch.randn(2, 4, 2, 2, 2)
+    action_tokens = torch.randn(2, 3, cfg.max_action_dim)
+    cond_input_ids = [torch.tensor([1, 2]), torch.tensor([1, 2, 3, 4])]
+    packed_samples = policy.model._pack_training_batch_static(
+        cond_input_ids=cond_input_ids,
+        vision_tokens=vision_tokens,
+        action_tokens=action_tokens,
+        conditioning_fps=torch.tensor([15.0, 15.0]),
+    )
+    vision_timesteps = [torch.full((sample["num_noisy_vision_tokens"],), 3.0) for sample in packed_samples]
+    action_timesteps = [torch.full((sample["num_noisy_action_tokens"],), 3.0) for sample in packed_samples]
+
+    with torch.no_grad():
+        batch_vision, batch_action = policy.model._predict_velocity_batch(
+            packed_samples=packed_samples,
+            vision_tokens=vision_tokens,
+            action_tokens=action_tokens,
+            vision_timesteps=vision_timesteps,
+            action_timesteps=action_timesteps,
+            action_domain_ids=torch.tensor([cfg.domain_id, cfg.domain_id]),
+            vision_condition_mask=torch.tensor([[[[[1.0]], [[0.0]]]]]),
+            action_condition_mask=torch.tensor([[[1.0], [0.0], [0.0]], [[1.0], [0.0], [0.0]]]),
+            raw_action_dims=torch.tensor([cfg.raw_action_dim, cfg.raw_action_dim]),
+        )
+
+    assert batch_vision.shape == vision_tokens.shape
+    assert batch_action.shape == action_tokens.shape

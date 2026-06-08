@@ -41,6 +41,7 @@ class Cosmos3Config(PreTrainedConfig):
 
     # Optional original Diffusers/Cosmos checkpoint used to initialize the runtime pipeline.
     diffusers_model_name_or_path: str | None = None
+    native_model_name_or_path: str | None = None
     qwen3_vl_config: dict | None = None
     wan_vae_config: dict | None = None
     transformer_config: dict | None = None
@@ -48,6 +49,7 @@ class Cosmos3Config(PreTrainedConfig):
     # Loading controls. Unit tests and checkpoint conversion can instantiate the policy
     # without loading the large Diffusers pipeline by setting this to False.
     load_diffusers_pipeline: bool = True
+    runtime_backend: str = "diffusers"  # Options: "diffusers", "native"
     dtype: str = "bfloat16"  # Options: "bfloat16", "float32"
     attn_implementation: str | None = None
     enable_safety_checker: bool = False
@@ -117,6 +119,8 @@ class Cosmos3Config(PreTrainedConfig):
             )
         if self.dtype not in {"bfloat16", "float32"}:
             raise ValueError(f"Invalid dtype: {self.dtype!r}")
+        if self.runtime_backend not in {"diffusers", "native"}:
+            raise ValueError(f"Invalid runtime_backend: {self.runtime_backend!r}")
         if self.mode != "policy":
             raise ValueError("Cosmos3Config currently supports only action mode='policy'.")
         if self.action_space != "joint_pos":

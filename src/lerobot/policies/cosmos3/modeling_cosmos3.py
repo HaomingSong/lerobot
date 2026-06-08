@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import math
+import sys
 from collections import deque
 from typing import TYPE_CHECKING, Any
 
@@ -35,6 +37,7 @@ from .processor_cosmos3 import (
     COSMOS3_ACTION_CONDITION,
     COSMOS3_ACTION_CONDITION_MASK,
     COSMOS3_ACTION_DOMAIN_ID,
+    COSMOS3_COMPOSED_IMAGE,
     COSMOS3_CONDITIONING_FPS,
     COSMOS3_PROMPT,
     COSMOS3_RAW_ACTION_DIM,
@@ -43,6 +46,17 @@ from .processor_cosmos3 import (
 
 if TYPE_CHECKING:
     from diffusers import Cosmos3OmniPipeline
+
+
+_COSMOS3_VAE_ENCODE_CHUNK_FRAMES = {"256": 68, "480": 24, "720": 12}
+_COSMOS3_VAE_ENCODE_EXACT_DURATIONS = {17}
+_COSMOS3_RESOLUTION_768_SHAPES = {
+    (1024, 1024),
+    (1184, 880),
+    (880, 1184),
+    (1360, 768),
+    (768, 1360),
+}
 
 
 def _torch_dtype(dtype_name: str) -> torch.dtype:
@@ -147,6 +161,209 @@ def _prepare_native_action_video_conditioning(
     return frames, image_size, target_h, target_w
 
 
+def _get_vision_data_resolution(spatial_shape: tuple[int, int]) -> str:
+    if spatial_shape in _COSMOS3_RESOLUTION_768_SHAPES:
+        return "768"
+    min_dim = min(spatial_shape)
+    if min_dim <= 256:
+        return "256"
+    if min_dim <= 640:
+        return "480"
+    if min_dim <= 960:
+        return "720"
+    raise ValueError(f"Unsupported Cosmos3 VAE spatial resolution: {spatial_shape}")
+
+
+def _patch_wan_vae_rms_norm() -> None:
+    from diffusers.models.autoencoders import autoencoder_kl_wan as wan_mod
+
+    if getattr(wan_mod.WanRMS_norm, "_lerobot_cosmos3_native_forward", False):
+        return
+
+    def native_forward(self, x: Tensor) -> Tensor:
+        return F.normalize(x, dim=(1 if self.channel_first else -1)) * self.scale * self.gamma + self.bias
+
+    wan_mod.WanRMS_norm.forward = native_forward
+    wan_mod.WanRMS_norm._lerobot_cosmos3_native_forward = True
+
+
+def _patch_cosmos_framework_transformers55_compat() -> None:
+    """Patch Cosmos Framework's vendored Qwen3-VL code for Transformers 5.5."""
+    try:
+        from transformers import modeling_rope_utils
+    except ImportError:
+        rope_init_functions = None
+    else:
+        rope_init_functions = modeling_rope_utils.ROPE_INIT_FUNCTIONS
+
+    if rope_init_functions is not None and "default" not in rope_init_functions:
+        rope_init_functions["default"] = rope_init_functions["proportional"]
+
+    try:
+        from cosmos_framework.model.vfm.vlm.qwen3_vl import configuration_qwen3_vl
+    except (ImportError, ModuleNotFoundError):
+        return
+
+    def patch_text_config(config_cls: type) -> None:
+        if getattr(config_cls, "_lerobot_cosmos3_transformers55_init", False):
+            return
+        original_init = config_cls.__init__
+
+        def patched_init(self, *args, pad_token_id=None, **kwargs):
+            kwargs.setdefault("pad_token_id", pad_token_id)
+            original_init(self, *args, **kwargs)
+            if not hasattr(self, "pad_token_id"):
+                self.pad_token_id = pad_token_id
+
+        config_cls.__init__ = patched_init
+        config_cls._lerobot_cosmos3_transformers55_init = True
+
+    patch_text_config(configuration_qwen3_vl.Qwen3VLTextConfig)
+    try:
+        from cosmos_framework.model.vfm.vlm.qwen3_vl_moe import configuration_qwen3_vl_moe
+
+        patch_text_config(configuration_qwen3_vl_moe.Qwen3VLMoeTextConfig)
+    except (ImportError, ModuleNotFoundError):
+        pass
+
+
+def _install_native_varlen_attention(transformer: nn.Module) -> int:
+    try:
+        from flash_attn.flash_attn_interface import flash_attn_varlen_func
+    except (ImportError, OSError):
+        return 0
+
+    from diffusers.models.transformers import transformer_cosmos3 as cosmos3_mod
+
+    def flash_varlen_attention(query: Tensor, key: Tensor, value: Tensor, *, is_causal: bool) -> Tensor:
+        if query.device.type != "cuda" or query.dtype not in (torch.bfloat16, torch.float16):
+            return cosmos3_mod.dispatch_attention_fn(
+                query.unsqueeze(0),
+                key.unsqueeze(0),
+                value.unsqueeze(0),
+                is_causal=is_causal,
+                enable_gqa=True,
+            ).squeeze(0)
+
+        cu_q = torch.tensor([0, query.shape[0]], dtype=torch.int32, device=query.device)
+        cu_kv = torch.tensor([0, key.shape[0]], dtype=torch.int32, device=query.device)
+        out, _lse, _ = flash_attn_varlen_func(
+            q=query,
+            k=key,
+            v=value,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_k=cu_kv,
+            max_seqlen_q=query.shape[0],
+            max_seqlen_k=key.shape[0],
+            softmax_scale=query.shape[-1] ** -0.5,
+            causal=is_causal,
+            return_attn_probs=True,
+            deterministic=False,
+        )
+        return out
+
+    class NativeVarlenCosmos3AttnProcessor(cosmos3_mod.Cosmos3AttnProcessor):
+        def __call__(
+            self,
+            attn: Any,
+            und_seq: Tensor,
+            gen_seq: Tensor,
+            rotary_emb: tuple[Tensor, Tensor, Tensor, Tensor],
+        ) -> tuple[Tensor, Tensor]:
+            q_und = attn.to_q(und_seq).view(-1, attn.num_attention_heads, attn.head_dim)
+            k_und = attn.to_k(und_seq).view(-1, attn.num_key_value_heads, attn.head_dim)
+            v_und = attn.to_v(und_seq).view(-1, attn.num_key_value_heads, attn.head_dim)
+            q_gen = attn.add_q_proj(gen_seq).view(-1, attn.num_attention_heads, attn.head_dim)
+            k_gen = attn.add_k_proj(gen_seq).view(-1, attn.num_key_value_heads, attn.head_dim)
+            v_gen = attn.add_v_proj(gen_seq).view(-1, attn.num_key_value_heads, attn.head_dim)
+
+            q_und = attn.norm_q(q_und)
+            k_und = attn.norm_k(k_und)
+            q_gen = attn.norm_added_q(q_gen)
+            k_gen = attn.norm_added_k(k_gen)
+
+            cos_und, sin_und, cos_gen, sin_gen = rotary_emb
+            cos_und = cos_und.unsqueeze(1)
+            sin_und = sin_und.unsqueeze(1)
+            q_und = q_und * cos_und + cosmos3_mod._rotate_half(q_und) * sin_und
+            k_und = k_und * cos_und + cosmos3_mod._rotate_half(k_und) * sin_und
+            cos_gen = cos_gen.unsqueeze(1)
+            sin_gen = sin_gen.unsqueeze(1)
+            q_gen = q_gen * cos_gen + cosmos3_mod._rotate_half(q_gen) * sin_gen
+            k_gen = k_gen * cos_gen + cosmos3_mod._rotate_half(k_gen) * sin_gen
+
+            causal_out = flash_varlen_attention(q_und, k_und, v_und, is_causal=True).flatten(-2, -1)
+            full_out = flash_varlen_attention(
+                q_gen, torch.cat([k_und, k_gen], dim=0), torch.cat([v_und, v_gen], dim=0), is_causal=False
+            ).flatten(-2, -1)
+            return attn.to_out(causal_out), attn.to_add_out(full_out)
+
+    processor = NativeVarlenCosmos3AttnProcessor()
+    installed = 0
+    for module in transformer.modules():
+        if isinstance(module, cosmos3_mod.Cosmos3PackedMoTAttention):
+            module.set_processor(processor)
+            installed += 1
+    return installed
+
+
+def _encode_video_native_order(pipeline: Cosmos3OmniPipeline, video: Tensor) -> Tensor:
+    """Encode video latents with the native Cosmos Wan2.2 VAE contract.
+
+    Diffusers' Wan VAE implementation upcasts RMS norm to fp32 and encodes in
+    4-frame chunks. Cosmos3's native tokenizer keeps bf16 RMS norm and uses a
+    resolution-dependent chunk window, normalizing each chunk before concat.
+    """
+    from diffusers.models.autoencoders.autoencoder_kl_wan import patchify
+
+    _patch_wan_vae_rms_norm()
+
+    vae = pipeline.vae
+    in_dtype = video.dtype
+    original_t = video.shape[2]
+    latent_t = 1 + (original_t - 1) // vae.config.scale_factor_temporal
+    encode_t = original_t
+    should_pad = encode_t not in _COSMOS3_VAE_ENCODE_EXACT_DURATIONS
+    resolution = _get_vision_data_resolution((int(video.shape[3]), int(video.shape[4])))
+    temporal_window = _COSMOS3_VAE_ENCODE_CHUNK_FRAMES[resolution]
+    if should_pad:
+        encode_t = 1 + math.ceil((encode_t - 1) / temporal_window) * temporal_window
+        video = F.pad(video, (0, 0, 0, 0, 0, encode_t - original_t))
+
+    mean = pipeline._vae_latents_mean.to(device=video.device, dtype=in_dtype)
+    inv_std = pipeline._vae_latents_inv_std.to(device=video.device, dtype=in_dtype)
+
+    vae.clear_cache()
+    try:
+        tokens = video.to(vae.dtype)
+        if vae.config.patch_size is not None:
+            tokens = patchify(tokens, patch_size=vae.config.patch_size)
+
+        chunks: list[Tensor] = []
+        for start in [0, *range(1, tokens.shape[2], temporal_window)]:
+            vae._enc_conv_idx = [0]
+            if start == 0:
+                encoded = vae.encoder(
+                    tokens[:, :, :1], feat_cache=vae._enc_feat_map, feat_idx=vae._enc_conv_idx
+                )
+            else:
+                encoded = vae.encoder(
+                    tokens[:, :, start : start + temporal_window].contiguous(),
+                    feat_cache=vae._enc_feat_map,
+                    feat_idx=vae._enc_conv_idx,
+                )
+            moments = vae.quant_conv(encoded)
+            mu, _log_var = moments.chunk(2, dim=1)
+            chunks.append((mu - mean.view(1, -1, 1, 1, 1)) * inv_std.view(1, -1, 1, 1, 1))
+
+        latents = torch.cat(chunks, dim=2) if len(chunks) > 1 else chunks[0]
+        if should_pad:
+            latents = latents[:, :, :latent_t]
+        return latents.to(in_dtype)
+    finally:
+        vae.clear_cache()
+
+
 _VIEWPOINT_TEMPLATES = {
     "concat_view": "This video contains concatenated views from multiple camera perspectives.",
     "ego_view": "This video is captured from a first-person perspective looking at the scene.",
@@ -221,9 +438,15 @@ class Cosmos3ActionModel(nn.Module):
         super().__init__()
         self.config = config
         self.pipeline = pipeline
+        self._native_service = None
+        self._native_robolab = None
         self._empty = nn.Parameter(torch.empty(0), requires_grad=False)
         self.reset_generation()
-        if self.pipeline is None and config.load_diffusers_pipeline:
+        if (
+            self.config.runtime_backend == "diffusers"
+            and self.pipeline is None
+            and config.load_diffusers_pipeline
+        ):
             self.pipeline = self._load_pipeline(config)
 
     def reset_generation(self) -> None:
@@ -242,6 +465,7 @@ class Cosmos3ActionModel(nn.Module):
             )
         from diffusers import Cosmos3OmniPipeline
 
+        _patch_wan_vae_rms_norm()
         pipeline = Cosmos3OmniPipeline.from_pretrained(
             config.diffusers_model_name_or_path,
             torch_dtype=_torch_dtype(config.dtype),
@@ -250,6 +474,7 @@ class Cosmos3ActionModel(nn.Module):
         )
         if not config.enable_safety_checker and hasattr(pipeline, "safety_checker"):
             pipeline.safety_checker = None
+        _install_native_varlen_attention(pipeline.transformer)
         pipeline.to(config.device)
         return pipeline
 
@@ -262,7 +487,9 @@ class Cosmos3ActionModel(nn.Module):
 
     @torch.no_grad()
     def sample_actions(self, batch: dict[str, Tensor], **kwargs) -> Tensor:
-        if self.pipeline is not None and hasattr(self.pipeline, "sample_actions_from_native_batch"):
+        if self.config.runtime_backend == "native":
+            actions = self._sample_actions_with_native_cosmos(batch, **kwargs)
+        elif self.pipeline is not None and hasattr(self.pipeline, "sample_actions_from_native_batch"):
             actions = self.pipeline.sample_actions_from_native_batch(
                 batch=batch, config=self.config, **kwargs
             )
@@ -286,6 +513,167 @@ class Cosmos3ActionModel(nn.Module):
         raise NotImplementedError(
             "Cosmos3 future-video decoding is reserved for a follow-up integration step."
         )
+
+    def _load_native_service(self) -> Any:
+        checkpoint_path = self.config.native_model_name_or_path or self.config.diffusers_model_name_or_path
+        if checkpoint_path is None:
+            raise ValueError(
+                "Cosmos3 native backend requires native_model_name_or_path or diffusers_model_name_or_path."
+            )
+
+        require_package("cosmos_framework", extra="cosmos3")
+        _patch_cosmos_framework_transformers55_compat()
+
+        if "imaginaire" not in sys.modules:
+            try:
+                from cosmos_framework.inference.common.init import init_script
+
+                init_script()
+            except RuntimeError as exc:
+                if "init_script" not in str(exc):
+                    raise
+
+        from cosmos_framework.inference.args import OmniSetupOverrides
+        from cosmos_framework.inference.common.init import init_output_dir
+        from cosmos_framework.scripts import action_policy_server_robolab as robolab
+        from cosmos_framework.scripts.action_policy_server_utils import disable_runtime_ema_for_frozen_config
+
+        def build_setup_args_no_guardrails(_service_self: Any, args: Any):
+            setup_overrides = {
+                "checkpoint_path": args.checkpoint_path,
+                "output_dir": args.output_dir or robolab._DEFAULT_ROBOLAB_OUTPUT_DIR,
+                "sampler": args.sampler,
+                "guardrails": False,
+                "vlm_processor_from_checkpoint": True,
+            }
+            if args.experiment is not None:
+                setup_overrides["experiment"] = args.experiment
+            if args.experiment_overrides:
+                setup_overrides["experiment_overrides"] = list(args.experiment_overrides)
+            if args.credential_path is not None:
+                setup_overrides["credential_path"] = args.credential_path
+            setup_args = OmniSetupOverrides.model_validate(setup_overrides).build_setup()
+            init_output_dir(setup_args.output_dir)
+            return disable_runtime_ema_for_frozen_config(setup_args)
+
+        robolab.RobolabPolicyService._build_setup_args = build_setup_args_no_guardrails
+        self._native_robolab = robolab
+        return robolab.RobolabPolicyService(
+            robolab.RobolabServerArgs(
+                checkpoint_path=str(checkpoint_path),
+                domain_name=self.config.domain_name,
+                decode_video=bool(self.config.generate_video),
+                seed=int(self.config.seed),
+                deterministic_seed=False,
+                guidance=float(self.config.guidance_scale),
+                num_steps=int(self.config.num_inference_steps),
+                shift=float(self.config.shift),
+                resolution=str(self.config.resolution_tier),
+                conditioning_fps=float(self.config.conditioning_fps),
+                action_chunk_size=int(self.config.chunk_size),
+                action_dim=int(self.config.raw_action_dim),
+                image_height=int(self.config.composed_image_height),
+                image_width=int(self.config.composed_image_width),
+                action_space=self.config.action_space,
+                use_state=bool(self.config.use_state),
+                history_length=int(self.config.history_length),
+            )
+        )
+
+    def _get_native_service(self) -> Any:
+        if self._native_service is None:
+            self._native_service = self._load_native_service()
+        return self._native_service
+
+    def _normalise_sample_seeds(self, seed: Any, batch_size: int) -> list[int]:
+        if seed is None:
+            return [self._next_seed() for _ in range(batch_size)]
+        if isinstance(seed, Tensor):
+            seed = seed.detach().cpu().flatten().tolist()
+        if isinstance(seed, (list, tuple)):
+            if len(seed) != batch_size:
+                raise ValueError(f"Expected {batch_size} Cosmos3 seeds, got {len(seed)}.")
+            return [int(item) for item in seed]
+        return [int(seed)] * batch_size
+
+    def _sample_actions_with_native_cosmos(
+        self,
+        batch: dict[str, Tensor],
+        *,
+        seed: int | list[int] | tuple[int, ...] | Tensor | None = None,
+        **kwargs,
+    ) -> Tensor:
+        if kwargs:
+            unsupported = ", ".join(sorted(kwargs))
+            raise ValueError(f"Cosmos3 native backend does not support sampling kwargs: {unsupported}")
+
+        required = [
+            COSMOS3_PROMPT,
+            COSMOS3_COMPOSED_IMAGE,
+            COSMOS3_ACTION_CONDITION,
+            COSMOS3_RAW_ACTION_DIM,
+        ]
+        missing = [key for key in required if key not in batch]
+        if missing:
+            raise ValueError(f"Cosmos3 native batch is missing required model inputs: {missing}")
+
+        prompts = batch[COSMOS3_PROMPT]
+        if isinstance(prompts, str):
+            prompts = [prompts]
+        images = batch[COSMOS3_COMPOSED_IMAGE]
+        if images.ndim == 3:
+            images = images.unsqueeze(0)
+        action_conditions = batch[COSMOS3_ACTION_CONDITION]
+        if action_conditions.ndim == 2:
+            action_conditions = action_conditions.unsqueeze(0)
+
+        batch_size = len(prompts)
+        seeds = self._normalise_sample_seeds(seed, batch_size)
+        service = self._get_native_service()
+        robolab = self._native_robolab
+        if robolab is None:
+            raise RuntimeError("Cosmos3 native backend was not initialized.")
+
+        actions = []
+        for batch_idx, sample_seed in enumerate(seeds):
+            image = images[batch_idx].detach().cpu().numpy()
+            action_condition = action_conditions[batch_idx].detach().cpu().to(torch.float32).numpy()
+            state = action_condition[0, : self.config.raw_action_dim].copy()
+            joint_position = state[: self.config.joint_position_dim]
+            gripper_position = state[
+                self.config.joint_position_dim : self.config.joint_position_dim
+                + self.config.gripper_position_dim
+            ]
+            if self.config.invert_gripper:
+                gripper_position = 1.0 - gripper_position
+
+            sample = service._build_sample(
+                {
+                    "prompt": prompts[batch_idx],
+                    "observation/image": image,
+                    "observation/joint_position": joint_position[None],
+                    "observation/gripper_position": gripper_position[None],
+                }
+            )
+            data_batch = robolab._build_data_batch_from_sample(sample)
+            with service._lock:
+                samples = service.model.generate_samples_from_batch(
+                    data_batch,
+                    guidance=float(self.config.guidance_scale),
+                    seed=[sample_seed],
+                    num_steps=int(self.config.num_inference_steps),
+                    shift=float(self.config.shift),
+                )
+
+            action = samples["action"][0][:, : self.config.raw_action_dim]
+            if self.config.history_length:
+                action = action[self.config.history_length :]
+            action = action.detach().cpu().to(torch.float32)
+            if self.config.invert_gripper:
+                action[:, -1] = 1.0 - action[:, -1]
+            actions.append(action[: self.config.chunk_size])
+
+        return torch.stack(actions, dim=0)
 
     def _sample_actions_with_diffusers_native_contract(self, batch: dict[str, Tensor], **kwargs) -> Tensor:
         required = [
@@ -352,7 +740,7 @@ class Cosmos3ActionModel(nn.Module):
             device=device,
             dtype=dtype,
         )
-        x0_tokens_vision = pipeline._encode_video(vision_tensor).contiguous().float()
+        x0_tokens_vision = _encode_video_native_order(pipeline, vision_tensor).contiguous().float()
         x0_tokens_vision = pipeline._remove_action_video_padding_from_latent(
             x0_tokens_vision, action_image_size
         )
@@ -425,7 +813,7 @@ class Cosmos3ActionModel(nn.Module):
         )
 
         scheduler = self._make_native_action_scheduler()
-        scheduler.set_timesteps(num_inference_steps, device=device)
+        self._set_native_action_scheduler_timesteps(scheduler, num_inference_steps, device=device)
         timesteps = scheduler.timesteps
         pipeline._guidance_scale = guidance_scale
         pipeline._num_timesteps = len(timesteps)
@@ -498,6 +886,19 @@ class Cosmos3ActionModel(nn.Module):
         return actions[: self.config.chunk_size]
 
     def _make_native_action_scheduler(self):
+        try:
+            from cosmos_framework.model.vfm.diffusion.samplers.fm_solvers_unipc import (
+                FlowUniPCMultistepScheduler,
+            )
+
+            return FlowUniPCMultistepScheduler(
+                num_train_timesteps=int(self.pipeline.scheduler.config.num_train_timesteps),
+                shift=1.0,
+                use_dynamic_shifting=bool(self.pipeline.scheduler.config.use_dynamic_shifting),
+            )
+        except (ImportError, ModuleNotFoundError):
+            pass
+
         from diffusers import UniPCMultistepScheduler
 
         return UniPCMultistepScheduler.from_config(
@@ -506,6 +907,14 @@ class Cosmos3ActionModel(nn.Module):
             use_flow_sigmas=True,
             flow_shift=float(self.config.shift),
         )
+
+    def _set_native_action_scheduler_timesteps(
+        self, scheduler: Any, num_inference_steps: int, *, device: torch.device | str
+    ) -> None:
+        if scheduler.__class__.__name__ == "FlowUniPCMultistepScheduler":
+            scheduler.set_timesteps(num_inference_steps, device=device, shift=float(self.config.shift))
+        else:
+            scheduler.set_timesteps(num_inference_steps, device=device)
 
     def _format_native_action_prompt(
         self, prompt: str, *, num_frames: int, height: int, width: int, fps: float

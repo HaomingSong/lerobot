@@ -227,7 +227,20 @@ class Cosmos3Config(PreTrainedConfig):
 
     @property
     def unipc_scheduler_config(self) -> dict[str, Any] | None:
-        return _without_keys(self.scheduler_config, _SCHEDULER_CONFIG_DROP_KEYS)
+        config = _without_keys(self.scheduler_config, _SCHEDULER_CONFIG_DROP_KEYS) or {}
+        config.update(
+            {
+                "prediction_type": "flow_prediction",
+                "use_flow_sigmas": True,
+                "use_karras_sigmas": False,
+                "use_exponential_sigmas": False,
+                "use_beta_sigmas": False,
+                "flow_shift": float(self.shift),
+                "timestep_spacing": "linspace",
+                "final_sigmas_type": "zero",
+            }
+        )
+        return config
 
     def validate_features(self) -> None:
         if self.input_features is None:

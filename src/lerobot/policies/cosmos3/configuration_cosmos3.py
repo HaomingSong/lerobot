@@ -78,6 +78,23 @@ def _without_keys(config: dict[str, Any] | None, keys: set[str]) -> dict[str, An
     return cleaned
 
 
+def _native_action_scheduler_config(config: dict[str, Any] | None, *, shift: float) -> dict[str, Any]:
+    normalized = _without_keys(config, _SCHEDULER_CONFIG_DROP_KEYS) or {}
+    normalized.update(
+        {
+            "prediction_type": "flow_prediction",
+            "use_flow_sigmas": True,
+            "use_karras_sigmas": False,
+            "use_exponential_sigmas": False,
+            "use_beta_sigmas": False,
+            "flow_shift": float(shift),
+            "timestep_spacing": "linspace",
+            "final_sigmas_type": "zero",
+        }
+    )
+    return normalized
+
+
 @PreTrainedConfig.register_subclass("cosmos3")
 @dataclass
 class Cosmos3Config(PreTrainedConfig):
@@ -168,6 +185,7 @@ class Cosmos3Config(PreTrainedConfig):
     def __post_init__(self):
         super().__post_init__()
         self._populate_serialized_subconfigs()
+        self.scheduler_config = _native_action_scheduler_config(self.scheduler_config, shift=self.shift)
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
                 f"n_action_steps ({self.n_action_steps}) cannot be greater than chunk_size ({self.chunk_size})"
@@ -227,20 +245,7 @@ class Cosmos3Config(PreTrainedConfig):
 
     @property
     def unipc_scheduler_config(self) -> dict[str, Any] | None:
-        config = _without_keys(self.scheduler_config, _SCHEDULER_CONFIG_DROP_KEYS) or {}
-        config.update(
-            {
-                "prediction_type": "flow_prediction",
-                "use_flow_sigmas": True,
-                "use_karras_sigmas": False,
-                "use_exponential_sigmas": False,
-                "use_beta_sigmas": False,
-                "flow_shift": float(self.shift),
-                "timestep_spacing": "linspace",
-                "final_sigmas_type": "zero",
-            }
-        )
-        return config
+        return _native_action_scheduler_config(self.scheduler_config, shift=self.shift)
 
     def validate_features(self) -> None:
         if self.input_features is None:

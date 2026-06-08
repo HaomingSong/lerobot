@@ -28,6 +28,7 @@ import torch.nn.functional as F  # noqa: N812
 from safetensors import safe_open
 from torch import Tensor, nn
 
+from lerobot.configs import PreTrainedConfig
 from lerobot.utils.constants import ACTION
 from lerobot.utils.import_utils import require_package
 
@@ -244,7 +245,9 @@ class Cosmos3Policy(PreTrainedPolicy):
     @classmethod
     def from_pretrained(cls, pretrained_name_or_path: str | Path, *args, config=None, **kwargs):
         if config is None:
-            config = Cosmos3Config.from_pretrained(pretrained_name_or_path, **kwargs)
+            config = PreTrainedConfig.from_pretrained(pretrained_name_or_path, **kwargs)
+        if not isinstance(config, Cosmos3Config):
+            raise TypeError(f"Expected Cosmos3Config, got {type(config)!r}.")
         config.pretrained_path = Path(pretrained_name_or_path)
         return super().from_pretrained(pretrained_name_or_path, *args, config=config, **kwargs)
 

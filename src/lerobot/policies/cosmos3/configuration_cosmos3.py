@@ -40,6 +40,7 @@ COSMOS3_CONCAT_VIEW_DESCRIPTION = (
 _TRANSFORMER_CONFIG_DROP_KEYS = {
     "_class_name",
     "_diffusers_version",
+    "dtype",
     "freeze_und",
     "hidden_act",
     "initializer_range",
@@ -57,7 +58,7 @@ _TRANSFORMER_CONFIG_DROP_KEYS = {
     "video_temporal_causal",
 }
 
-_VAE_CONFIG_DROP_KEYS = {"_class_name", "_diffusers_version"}
+_VAE_CONFIG_DROP_KEYS = {"_class_name", "_diffusers_version", "clip_output"}
 _SCHEDULER_CONFIG_DROP_KEYS = {"_class_name", "_diffusers_version"}
 
 

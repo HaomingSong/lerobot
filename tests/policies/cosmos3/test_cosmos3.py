@@ -45,7 +45,6 @@ from lerobot.utils.constants import ACTION, OBS_STATE
 def make_config() -> Cosmos3Config:
     return Cosmos3Config(
         device="cpu",
-        load_pretrained_weights=False,
         transformer_config={
             "hidden_size": 8,
             "intermediate_size": 16,
@@ -61,7 +60,7 @@ def make_config() -> Cosmos3Config:
             "vocab_size": 128,
             "rope_scaling": {"mrope_section": [2, 1, 1]},
         },
-        wan_vae_config={
+        vae_config={
             "base_dim": 4,
             "decoder_base_dim": 4,
             "z_dim": 4,
@@ -97,7 +96,7 @@ def constant_image_sequence(value: int, num_frames: int) -> torch.Tensor:
 
 
 def test_cosmos3_factory_registration():
-    cfg = make_policy_config("cosmos3", device="cpu", load_pretrained_weights=False)
+    cfg = make_policy_config("cosmos3", device="cpu")
 
     assert isinstance(cfg, Cosmos3Config)
     assert get_policy_class("cosmos3") is Cosmos3Policy

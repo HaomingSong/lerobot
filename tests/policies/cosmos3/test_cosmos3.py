@@ -28,7 +28,7 @@ from lerobot.policies.cosmos3.configuration_cosmos3 import (
 )
 from lerobot.policies.cosmos3.modeling_cosmos3 import (
     Cosmos3Policy,
-    _prepare_native_action_video_conditioning,
+    _prepare_native_action_video_conditioning_batch,
 )
 from lerobot.policies.cosmos3.processor_cosmos3 import (
     COSMOS3_ACTION_CONDITION,
@@ -222,11 +222,11 @@ def test_cosmos3_native_action_prompt_matches_robolab_string_transform():
     )
 
 
-def test_cosmos3_video_conditioning_matches_native_resize_contract():
-    video = torch.zeros(3, 33, 540, 640, dtype=torch.uint8)
-    video[:, 0] = torch.tensor([10, 20, 30], dtype=torch.uint8).view(3, 1, 1)
+def test_cosmos3_video_conditioning_batch_matches_native_resize_contract():
+    video = torch.zeros(2, 3, 33, 540, 640, dtype=torch.uint8)
+    video[:, :, 0] = torch.tensor([10, 20, 30], dtype=torch.uint8).view(1, 3, 1, 1)
 
-    frames, image_size, height, width = _prepare_native_action_video_conditioning(
+    frames, image_size, height, width = _prepare_native_action_video_conditioning_batch(
         video,
         resolution_tier=480,
         num_frames=33,
@@ -234,7 +234,7 @@ def test_cosmos3_video_conditioning_matches_native_resize_contract():
         dtype=torch.float32,
     )
 
-    assert frames.shape == (1, 3, 33, 544, 736)
+    assert frames.shape == (2, 3, 33, 544, 736)
     torch.testing.assert_close(image_size, torch.tensor([544.0, 736.0, 540.0, 640.0]))
     assert (height, width) == (544, 736)
     torch.testing.assert_close(frames[0, :, 0, 0, 0], torch.tensor([10, 20, 30]) / 127.5 - 1.0)
@@ -259,21 +259,21 @@ def test_cosmos3_select_action_uses_chunk_queue(monkeypatch):
     assert sample_calls["count"] == 1
 
 
-def test_cosmos3_masked_flow_matching_mse_matches_native_denominator():
+def test_cosmos3_masked_flow_matching_mse_uses_per_sample_batch_denominator():
     policy = Cosmos3Policy(make_config())
-    pred = torch.tensor([[0.0, 0.0], [2.0, 4.0]])
-    target = torch.tensor([[5.0, 5.0], [1.0, 1.0]])
-    noisy_mask = torch.tensor([[0.0], [1.0]])
+    pred = torch.tensor([[10.0, 0.0], [2.0, 4.0]])
+    target = torch.zeros_like(pred)
+    noisy_mask = torch.tensor([[1.0, 0.0], [1.0, 1.0]])
 
     torch.testing.assert_close(
-        policy.model._masked_flow_matching_mse(pred, target, noisy_mask),
-        torch.tensor(2.5),
+        policy.model._masked_flow_matching_mse_by_sample(pred, target, noisy_mask),
+        torch.tensor(30.0),
     )
 
     policy.config.normalize_loss_by_active = True
     torch.testing.assert_close(
-        policy.model._masked_flow_matching_mse(pred, target, noisy_mask),
-        torch.tensor(5.0),
+        policy.model._masked_flow_matching_mse_by_sample(pred, target, noisy_mask),
+        torch.tensor(55.0),
     )
 
 

@@ -160,51 +160,6 @@ def _arch_invariant_rand(
     return torch.from_numpy(random_array).to(dtype=dtype, device=device)
 
 
-def _prepare_native_action_video_conditioning(
-    video: Tensor,
-    *,
-    resolution_tier: int,
-    num_frames: int,
-    device: torch.device | str,
-    dtype: torch.dtype,
-) -> tuple[Tensor, Tensor, int, int]:
-    if video.dtype != torch.uint8:
-        raise ValueError(f"Cosmos3 action video input must be uint8, got dtype={video.dtype}.")
-    if video.ndim != 4:
-        raise ValueError(f"Expected Cosmos3 action video shape [C,T,H,W], got shape={tuple(video.shape)}.")
-
-    frames = video.detach().to(device=device)
-    source_h, source_w = frames.shape[-2:]
-    target_h, target_w, content_h, content_w = classify_cosmos3_action_size(
-        source_h,
-        source_w,
-        resolution_tier=resolution_tier,
-    )
-
-    if frames.shape[1] < num_frames:
-        frames = torch.cat([frames, frames[:, -1:].expand(-1, num_frames - frames.shape[1], -1, -1)], dim=1)
-    else:
-        frames = frames[:, :num_frames]
-
-    frames_t = frames.permute(1, 0, 2, 3).to(dtype=torch.float32)
-    if content_h != source_h or content_w != source_w:
-        frames_t = F.interpolate(
-            frames_t,
-            size=(content_h, content_w),
-            mode="bicubic",
-            align_corners=False,
-            antialias=True,
-        )
-    pad_right = target_w - content_w
-    pad_bottom = target_h - content_h
-    if pad_right or pad_bottom:
-        pad_mode = "replicate" if pad_right >= content_w or pad_bottom >= content_h else "reflect"
-        frames_t = F.pad(frames_t, (0, pad_right, 0, pad_bottom), mode=pad_mode)
-    frames = frames_t.permute(1, 0, 2, 3).unsqueeze(0).to(device=device, dtype=dtype) / 127.5 - 1.0
-    image_size = torch.tensor([target_h, target_w, content_h, content_w], device=device, dtype=torch.float32)
-    return frames, image_size, target_h, target_w
-
-
 def _prepare_native_action_video_conditioning_batch(
     videos: Tensor,
     *,
@@ -627,15 +582,6 @@ class Cosmos3ActionModel(nn.Module):
             "flow_matching_loss_vision": vision_loss,
             "flow_matching_loss_action": action_loss,
         }
-
-    def _masked_flow_matching_mse(self, pred: Tensor, target: Tensor, noisy_mask: Tensor) -> Tensor:
-        noisy_mask = noisy_mask.to(device=pred.device, dtype=pred.dtype)
-        sqerr = (pred - target) ** 2 * noisy_mask
-        if not self.config.normalize_loss_by_active:
-            return sqerr.mean()
-
-        active_count = noisy_mask.expand_as(pred).sum()
-        return sqerr.sum() / active_count.clamp_min(1.0)
 
     def _masked_flow_matching_mse_by_sample(self, pred: Tensor, target: Tensor, noisy_mask: Tensor) -> Tensor:
         noisy_mask = noisy_mask.to(device=pred.device, dtype=pred.dtype).expand_as(pred)

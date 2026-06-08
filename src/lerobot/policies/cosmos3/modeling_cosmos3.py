@@ -328,6 +328,10 @@ class Cosmos3ActionModel(nn.Module):
             module = getattr(self.transformer, module_name, None)
             if module is not None:
                 module.float()
+        rotary_emb = getattr(self.transformer, "rotary_emb", None)
+        inv_freq = getattr(rotary_emb, "inv_freq", None)
+        if inv_freq is not None and inv_freq.device.type != "meta" and inv_freq.dtype != torch.float32:
+            rotary_emb.register_buffer("inv_freq", inv_freq.float(), persistent=False)
 
     def reset_generation(self) -> None:
         self._rng = np.random.default_rng(self.config.seed)

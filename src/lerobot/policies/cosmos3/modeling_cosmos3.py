@@ -249,7 +249,9 @@ class Cosmos3Policy(PreTrainedPolicy):
         if not isinstance(config, Cosmos3Config):
             raise TypeError(f"Expected Cosmos3Config, got {type(config)!r}.")
         config.pretrained_path = Path(pretrained_name_or_path)
-        return super().from_pretrained(pretrained_name_or_path, *args, config=config, **kwargs)
+        policy = super().from_pretrained(pretrained_name_or_path, *args, config=config, **kwargs)
+        policy.model.ensure_runtime_dtypes()
+        return policy
 
     def __init__(self, config: Cosmos3Config, **kwargs):
         require_package("diffusers", extra="cosmos3")
@@ -263,6 +265,7 @@ class Cosmos3Policy(PreTrainedPolicy):
             vae=kwargs.pop("vae", None),
             scheduler=kwargs.pop("scheduler", None),
         )
+        self.model.ensure_runtime_dtypes()
         self.to(config.device)
         self.reset()
 
@@ -319,6 +322,12 @@ class Cosmos3ActionModel(nn.Module):
         if self.config.freeze_vae:
             self.vae.eval().requires_grad_(False)
         self.reset_generation()
+
+    def ensure_runtime_dtypes(self) -> None:
+        for module_name in getattr(self.transformer, "_keep_in_fp32_modules", []) or []:
+            module = getattr(self.transformer, module_name, None)
+            if module is not None:
+                module.float()
 
     def reset_generation(self) -> None:
         self._rng = np.random.default_rng(self.config.seed)

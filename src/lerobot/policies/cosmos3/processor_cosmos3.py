@@ -565,10 +565,6 @@ class Cosmos3QwenPromptTokenizerStep(ComplementaryDataProcessorStep):
             add_vision_id=False,
             return_dict=False,
         )
-        input_ids = list(input_ids) + [
-            self._special_tokens["eos_token_id"],
-            self._special_tokens["start_of_generation"],
-        ]
         return torch.tensor(input_ids, dtype=torch.long)
 
     def complementary_data(self, complementary_data: dict[str, Any]) -> dict[str, Any]:

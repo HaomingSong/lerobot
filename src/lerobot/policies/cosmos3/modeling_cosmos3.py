@@ -699,7 +699,7 @@ class Cosmos3ActionModel(nn.Module):
             action_latents=noised_action.to(dtype=dtype),
             vision_condition_indexes=[0],
             fps_vision=float(conditioning_fps.item()),
-            action_start_frame_offset=0 if self.config.use_state else 1,
+            action_start_frame_offset=1,
         )
 
         max_timestep = float(getattr(self.scheduler.config, "num_train_timesteps", 1000))
@@ -915,7 +915,7 @@ class Cosmos3ActionModel(nn.Module):
             action_latents=action_latents,
             vision_condition_indexes=vision_condition_indexes,
             fps_vision=float(conditioning_fps.item()),
-            action_start_frame_offset=0 if self.config.use_state else 1,
+            action_start_frame_offset=1,
         )
         uncond_packed_static = self._pack_static_segments(
             text_segment=self._prepare_text_segment(uncond_input_ids, device=device),
@@ -923,7 +923,7 @@ class Cosmos3ActionModel(nn.Module):
             action_latents=action_latents,
             vision_condition_indexes=vision_condition_indexes,
             fps_vision=float(conditioning_fps.item()),
-            action_start_frame_offset=0 if self.config.use_state else 1,
+            action_start_frame_offset=1,
         )
 
         scheduler = self.scheduler

@@ -66,7 +66,7 @@ def make_config() -> Cosmos3Config:
             "vocab_size": 128,
             "rope_scaling": {"mrope_section": [2, 1, 1]},
         },
-        wan_vae_config={
+        vae_config={
             "base_dim": 4,
             "decoder_base_dim": 4,
             "z_dim": 4,
@@ -110,23 +110,6 @@ def test_cosmos3_factory_registration():
     preprocessor, postprocessor = make_pre_post_processors(cfg)
     assert preprocessor.name == "policy_preprocessor"
     assert postprocessor.name == "policy_postprocessor"
-
-
-def test_cosmos3_config_ignores_external_checkpoint_layout(tmp_path):
-    transformer_dir = tmp_path / "transformer"
-    transformer_dir.mkdir()
-    (transformer_dir / "config.json").write_text('{"hidden_size": 999}', encoding="utf-8")
-
-    cfg = Cosmos3Config(
-        device="cpu",
-        diffusers_model_name_or_path=str(tmp_path),
-        transformer_config={"hidden_size": 8, "action_dim": 64, "action_gen": True},
-        wan_vae_config={"z_dim": 4},
-        scheduler_config={"flow_shift": 5.0},
-    )
-
-    assert cfg.transformer_config == {"hidden_size": 8, "action_dim": 64, "action_gen": True}
-    assert cfg.text_processor_name_or_path is None
 
 
 def test_cosmos3_robolab_processor_packs_native_contract():

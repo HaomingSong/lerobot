@@ -326,14 +326,19 @@ class Cosmos3ActionModel(nn.Module):
         if self.config.vae_config is not None:
             return AutoencoderKLWan(**self.config.vae_config).to(dtype=torch_dtype)
         raise ValueError(
-            "Cosmos3Config.wan_vae_config is required. "
+            "Cosmos3Config.vae_config is required. "
             "Load a converted LeRobot Cosmos3 checkpoint or provide the serialized VAE config."
         )
 
     def _build_scheduler(self) -> Any:
         from diffusers import UniPCMultistepScheduler
 
-        return UniPCMultistepScheduler.from_config(self.config.unipc_scheduler_config)
+        if self.config.scheduler_config is None:
+            raise ValueError(
+                "Cosmos3Config.scheduler_config is required. "
+                "Load a converted LeRobot Cosmos3 checkpoint or provide the serialized scheduler config."
+            )
+        return UniPCMultistepScheduler.from_config(self.config.scheduler_config)
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         required = [

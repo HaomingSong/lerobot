@@ -34,53 +34,6 @@ COSMOS3_CONCAT_VIEW_DESCRIPTION = (
     "opposite sides, with the robot visible."
 )
 
-_TRANSFORMER_CONFIG_DROP_KEYS = {
-    "_class_name",
-    "_diffusers_version",
-    "dtype",
-    "freeze_und",
-    "hidden_act",
-    "initializer_range",
-    "joint_attn_implementation",
-    "max_action_dim",
-    "max_position_embeddings",
-    "model_type",
-    "position_embedding_type",
-    "qk_norm",
-    "qk_norm_for_diffusion",
-    "qk_norm_for_text",
-    "temporal_compression_factor_sound",
-    "use_cache",
-    "use_moe",
-    "video_temporal_causal",
-}
-
-_VAE_CONFIG_DROP_KEYS = {"_class_name", "_diffusers_version", "clip_output"}
-_SCHEDULER_CONFIG_DROP_KEYS = {"_class_name", "_diffusers_version"}
-
-
-def _without_keys(config: dict[str, Any] | None, keys: set[str]) -> dict[str, Any] | None:
-    if config is None:
-        return None
-    return {key: value for key, value in config.items() if key not in keys}
-
-
-def _action_scheduler_config(config: dict[str, Any] | None, *, shift: float) -> dict[str, Any]:
-    normalized = _without_keys(config, _SCHEDULER_CONFIG_DROP_KEYS) or {}
-    normalized.update(
-        {
-            "prediction_type": "flow_prediction",
-            "use_flow_sigmas": True,
-            "use_karras_sigmas": False,
-            "use_exponential_sigmas": False,
-            "use_beta_sigmas": False,
-            "flow_shift": float(shift),
-            "timestep_spacing": "linspace",
-            "final_sigmas_type": "zero",
-        }
-    )
-    return normalized
-
 
 @PreTrainedConfig.register_subclass("cosmos3")
 @dataclass
@@ -91,22 +44,12 @@ class Cosmos3Config(PreTrainedConfig):
     # model weights through PreTrainedPolicy.from_pretrained(model.safetensors).
     text_processor_name_or_path: str | None = None
     transformer_config: dict[str, Any] | None = None
-    wan_vae_config: dict[str, Any] | None = None
+    vae_config: dict[str, Any] | None = None
     scheduler_config: dict[str, Any] | None = None
 
-    # Legacy fields accepted only so older converted LeRobot config.json files
-    # continue to parse. Runtime initialization ignores external source paths.
-    diffusers_model_name_or_path: str | None = None
-    base_model_name_or_path: str | None = None
-    qwen3_vl_name_or_path: str | None = None
-    load_pretrained_weights: bool = False
-    drop_sound_modules: bool = True
-    copy_understanding_to_generation_expert: bool = False
-
-    # Public model-level loading controls.
+    # Public model-level controls.
     freeze_vae: bool = True
     dtype: str = "bfloat16"  # Options: "bfloat16", "float32"
-    transformer_attention_backend: str | None = None
     local_files_only: bool = True
 
     # RoboLab/DROID policy contract.
@@ -191,25 +134,15 @@ class Cosmos3Config(PreTrainedConfig):
 
     @property
     def transformer_backbone_config(self) -> dict[str, Any]:
-        config = _without_keys(self.transformer_config, _TRANSFORMER_CONFIG_DROP_KEYS)
-        if config is None:
+        if self.transformer_config is None:
             raise ValueError(
                 "Cosmos3Config.transformer_config is required. "
                 "Load a converted LeRobot Cosmos3 checkpoint or provide the serialized transformer config."
             )
-        config["sound_dim"] = None
-        config["sound_gen"] = False
+        config = dict(self.transformer_config)
         config.setdefault("action_dim", self.max_action_dim)
         config.setdefault("action_gen", True)
         return config
-
-    @property
-    def vae_config(self) -> dict[str, Any] | None:
-        return _without_keys(self.wan_vae_config, _VAE_CONFIG_DROP_KEYS)
-
-    @property
-    def unipc_scheduler_config(self) -> dict[str, Any]:
-        return _action_scheduler_config(self.scheduler_config, shift=self.shift)
 
     def validate_features(self) -> None:
         if self.input_features is None:

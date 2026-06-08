@@ -55,9 +55,11 @@ COSMOS3_ACTION_CONDITION_MASK = "cosmos3_action_condition_mask"
 COSMOS3_ACTION_DOMAIN_ID = "cosmos3_action_domain_id"
 COSMOS3_CONDITIONING_FPS = "cosmos3_conditioning_fps"
 COSMOS3_RAW_ACTION_DIM = "cosmos3_raw_action_dim"
+COSMOS3_CLEAN_ACTION = "cosmos3_clean_action"
 COSMOS3_IMAGE_SIZE = "cosmos3_image_size"
 COSMOS3_PROMPT = "cosmos3_prompt"
 COSMOS3_SEQUENCE_METADATA = "cosmos3_sequence_metadata"
+COSMOS3_TRAINING_SIGMA = "cosmos3_training_sigma"
 
 
 def _as_batched_image_tensor(image: torch.Tensor) -> tuple[torch.Tensor, bool]:
@@ -86,6 +88,47 @@ def _to_uint8_nhwc(image: torch.Tensor) -> np.ndarray:
         image = image.clamp(0.0, 1.0).mul(255.0)
     image = image.round().clamp(0, 255).to(torch.uint8)
     return image.permute(0, 2, 3, 1).cpu().numpy()
+
+
+def _as_batched_image_sequence_tensor(
+    image: torch.Tensor, *, sequence_length: int | None = None
+) -> torch.Tensor:
+    if image.ndim == 5:
+        if image.shape[2] in {1, 3, 4}:
+            image = image
+        elif image.shape[-1] in {1, 3, 4}:
+            image = image.permute(0, 1, 4, 2, 3)
+        else:
+            raise ValueError(f"Could not infer image channel dimension from shape={tuple(image.shape)}")
+        if image.shape[2] == 4:
+            image = image[:, :, :3]
+        if image.shape[2] == 1:
+            image = image.expand(-1, -1, 3, -1, -1)
+        return image.contiguous()
+
+    if image.ndim == 4 and sequence_length is not None and image.shape[0] == sequence_length:
+        if image.shape[1] in {1, 3, 4}:
+            image = image.unsqueeze(0)
+        elif image.shape[-1] in {1, 3, 4}:
+            image = image.permute(0, 3, 1, 2).unsqueeze(0)
+        else:
+            raise ValueError(f"Could not infer image channel dimension from shape={tuple(image.shape)}")
+        if image.shape[2] == 4:
+            image = image[:, :, :3]
+        if image.shape[2] == 1:
+            image = image.expand(-1, -1, 3, -1, -1)
+        return image.contiguous()
+
+    image, _ = _as_batched_image_tensor(image)
+    return image.unsqueeze(1)
+
+
+def _to_uint8_nthwc(image: torch.Tensor, *, sequence_length: int | None = None) -> np.ndarray:
+    image = _as_batched_image_sequence_tensor(image, sequence_length=sequence_length)
+    if image.dtype.is_floating_point:
+        image = image.clamp(0.0, 1.0).mul(255.0)
+    image = image.round().clamp(0, 255).to(torch.uint8)
+    return image.permute(0, 1, 3, 4, 2).cpu().numpy()
 
 
 def resize_with_pad_uint8(images: np.ndarray, height: int, width: int) -> np.ndarray:
@@ -123,24 +166,39 @@ def compose_robolab_cosmos3_image(
     *,
     image_height: int,
     image_width: int,
+    sequence_length: int | None = None,
 ) -> torch.Tensor:
     """Compose RoboLab's wrist/top and shoulder/bottom image layout as uint8 NHWC."""
-    left = resize_with_pad_uint8(_to_uint8_nhwc(left_image), image_height, image_width)
-    right = resize_with_pad_uint8(_to_uint8_nhwc(right_image), image_height, image_width)
-    wrist = resize_with_pad_uint8(_to_uint8_nhwc(wrist_image), image_height, image_width)
+    left = resize_with_pad_uint8(
+        _to_uint8_nthwc(left_image, sequence_length=sequence_length), image_height, image_width
+    )
+    right = resize_with_pad_uint8(
+        _to_uint8_nthwc(right_image, sequence_length=sequence_length), image_height, image_width
+    )
+    wrist = resize_with_pad_uint8(
+        _to_uint8_nthwc(wrist_image, sequence_length=sequence_length), image_height, image_width
+    )
 
     bottom_size = (image_height // 2, image_width // 2)
-    left_half = torch.from_numpy(left).permute(0, 3, 1, 2).float()
+    leading_shape = left.shape[:-3]
+    left_flat = torch.from_numpy(left.reshape(-1, *left.shape[-3:]))
+    left_half = left_flat.permute(0, 3, 1, 2).float()
     left_half = F.interpolate(left_half, size=bottom_size, mode="bilinear")
     left_half = left_half.permute(0, 2, 3, 1).numpy().astype(wrist.dtype)
+    left_half = left_half.reshape(*leading_shape, *left_half.shape[-3:])
 
-    right_half = torch.from_numpy(right).permute(0, 3, 1, 2).float()
+    right_flat = torch.from_numpy(right.reshape(-1, *right.shape[-3:]))
+    right_half = right_flat.permute(0, 3, 1, 2).float()
     right_half = F.interpolate(right_half, size=bottom_size, mode="bilinear")
     right_half = right_half.permute(0, 2, 3, 1).numpy().astype(wrist.dtype)
+    right_half = right_half.reshape(*leading_shape, *right_half.shape[-3:])
 
-    bottom = np.concatenate((left_half, right_half), axis=2)
-    composed = np.concatenate((wrist, bottom), axis=1)
-    return torch.from_numpy(composed)
+    bottom = np.concatenate((left_half, right_half), axis=-2)
+    composed = np.concatenate((wrist, bottom), axis=-3)
+    composed_tensor = torch.from_numpy(composed)
+    if composed_tensor.shape[1] == 1:
+        return composed_tensor[:, 0]
+    return composed_tensor
 
 
 def _normalise_prompt_list(prompts: Any, batch_size: int) -> list[str]:
@@ -194,23 +252,33 @@ class Cosmos3RoboLabPackInputsStep(ComplementaryDataProcessorStep):
             wrist,
             image_height=self.image_height,
             image_width=self.image_width,
+            sequence_length=self.chunk_size + 1,
         )
-        if composed.shape[1:3] != (self.composed_image_height, self.composed_image_width):
+        if composed.shape[-3:-1] != (self.composed_image_height, self.composed_image_width):
             raise ValueError(
                 "Unexpected composed Cosmos3 image shape: "
-                f"{tuple(composed.shape[1:3])}, expected {(self.composed_image_height, self.composed_image_width)}."
+                f"{tuple(composed.shape[-3:-1])}, expected {(self.composed_image_height, self.composed_image_width)}."
             )
 
         batch_size = composed.shape[0]
-        video = torch.zeros(
-            batch_size,
-            3,
-            self.chunk_size + 1,
-            self.composed_image_height,
-            self.composed_image_width,
-            dtype=torch.uint8,
-        )
-        video[:, :, 0] = composed.permute(0, 3, 1, 2)
+        if composed.ndim == 4:
+            video = torch.zeros(
+                batch_size,
+                3,
+                self.chunk_size + 1,
+                self.composed_image_height,
+                self.composed_image_width,
+                dtype=torch.uint8,
+            )
+            video[:, :, 0] = composed.permute(0, 3, 1, 2)
+        elif composed.ndim == 5:
+            if composed.shape[1] < self.chunk_size + 1:
+                pad = composed[:, -1:].expand(-1, self.chunk_size + 1 - composed.shape[1], -1, -1, -1)
+                composed = torch.cat([composed, pad], dim=1)
+            composed = composed[:, : self.chunk_size + 1]
+            video = composed.permute(0, 4, 1, 2, 3).contiguous()
+        else:
+            raise ValueError(f"Unexpected composed Cosmos3 image rank: {composed.ndim}")
 
         action_len = self.chunk_size + int(self.use_state)
         action_condition = torch.zeros(batch_size, action_len, self.raw_action_dim, dtype=torch.float32)
@@ -219,6 +287,10 @@ class Cosmos3RoboLabPackInputsStep(ComplementaryDataProcessorStep):
             state = observation.get(OBS_STATE)
             if state is None:
                 raise ValueError(f"{OBS_STATE} is required when Cosmos3 use_state=True.")
+            if state.ndim == 3:
+                state = state[:, 0]
+            if state.ndim == 2 and state.shape[0] != batch_size and state.shape[0] == self.chunk_size + 1:
+                state = state[:1]
             if state.ndim == 1:
                 state = state.unsqueeze(0)
             state = state.to(dtype=torch.float32)
@@ -234,6 +306,25 @@ class Cosmos3RoboLabPackInputsStep(ComplementaryDataProcessorStep):
                 state[:, -1] = 1.0 - state[:, -1]
             action_condition[:, 0] = state
             action_condition_mask[:, 0, 0] = 1.0
+
+        action = self.transition.get(TransitionKey.ACTION)
+        if action is not None:
+            if action.ndim == 2:
+                action = action.unsqueeze(0)
+            if action.ndim != 3:
+                raise ValueError(
+                    f"Cosmos3 training action must have shape [B,T,D], got {tuple(action.shape)}."
+                )
+            if action.shape[0] != batch_size:
+                raise ValueError("Batch size mismatch between Cosmos3 images and actions.")
+            action = action[:, : self.chunk_size, : self.raw_action_dim].to(dtype=torch.float32).clone()
+            if self.invert_gripper:
+                action[:, :, -1] = 1.0 - action[:, :, -1]
+            clean_action = torch.zeros(batch_size, action_len, self.max_action_dim, dtype=torch.float32)
+            clean_action[:, :, : self.raw_action_dim] = action_condition
+            future_start = int(self.use_state)
+            clean_action[:, future_start : future_start + action.shape[1], : self.raw_action_dim] = action
+            complementary_data[COSMOS3_CLEAN_ACTION] = clean_action
 
         prompts = _normalise_prompt_list(complementary_data.get(self.prompt_key), batch_size)
         complementary_data[COSMOS3_PROMPT] = prompts

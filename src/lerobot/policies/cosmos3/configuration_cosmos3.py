@@ -82,6 +82,10 @@ class Cosmos3Config(PreTrainedConfig):
     deterministic_seed: bool = False
     generate_video: bool = False
     output_type: str = "latent"
+    train_time_video_distribution: str = "waver"
+    video_loss_weight: float = 10.0
+    action_loss_weight: float = 10.0
+    normalize_loss_by_active: bool = False
 
     # Three-view image composition mirrors RoboLab/policies/cosmos3/client.py.
     left_image_key: str = COSMOS3_LEFT_IMAGE
@@ -170,8 +174,8 @@ class Cosmos3Config(PreTrainedConfig):
         )
 
     @property
-    def observation_delta_indices(self) -> None:
-        return None
+    def observation_delta_indices(self) -> list[int]:
+        return list(range(self.chunk_size + 1))
 
     @property
     def action_delta_indices(self) -> list[int]:

@@ -32,6 +32,7 @@ from lerobot.policies.cosmos3.modeling_cosmos3 import (
 from lerobot.policies.cosmos3.processor_cosmos3 import (
     COSMOS3_ACTION_CONDITION,
     COSMOS3_ACTION_CONDITION_MASK,
+    COSMOS3_CLEAN_ACTION,
     COSMOS3_COMPOSED_IMAGE,
     COSMOS3_PROMPT,
     COSMOS3_VIDEO,
@@ -57,6 +58,10 @@ def make_config() -> Cosmos3Config:
 
 def constant_image(value: int) -> torch.Tensor:
     return torch.full((3, 360, 640), value / 255.0, dtype=torch.float32)
+
+
+def constant_image_sequence(value: int, num_frames: int) -> torch.Tensor:
+    return torch.full((1, num_frames, 3, 360, 640), value / 255.0, dtype=torch.float32)
 
 
 def test_cosmos3_factory_registration():
@@ -106,6 +111,39 @@ def test_cosmos3_robolab_processor_packs_native_contract():
     torch.testing.assert_close(action_condition_mask[0, 0], torch.ones(1))
     assert torch.count_nonzero(action_condition_mask[0, 1:]) == 0
     assert processed[COSMOS3_PROMPT] == ["Pick up the banana and place it in the bowl."]
+
+
+def test_cosmos3_robolab_processor_packs_training_video_and_clean_actions():
+    cfg = make_config()
+    preprocessor, _ = make_cosmos3_pre_post_processors(cfg)
+    state = torch.zeros(1, cfg.chunk_size + 1, 8, dtype=torch.float32)
+    state[:, :, -1] = 0.25
+    actions = torch.zeros(1, cfg.chunk_size, 8, dtype=torch.float32)
+    actions[:, :, -1] = 0.75
+
+    batch = {
+        COSMOS3_LEFT_IMAGE: constant_image_sequence(10, cfg.chunk_size + 1),
+        COSMOS3_RIGHT_IMAGE: constant_image_sequence(20, cfg.chunk_size + 1),
+        COSMOS3_WRIST_IMAGE: constant_image_sequence(30, cfg.chunk_size + 1),
+        OBS_STATE: state,
+        ACTION: actions,
+        "task": ["Pick up the banana and place it in the bowl."],
+    }
+
+    processed = preprocessor(batch)
+
+    assert processed[COSMOS3_COMPOSED_IMAGE].shape == (1, cfg.chunk_size + 1, 540, 640, 3)
+    assert processed[COSMOS3_VIDEO].shape == (1, 3, cfg.chunk_size + 1, 540, 640)
+    torch.testing.assert_close(
+        processed[COSMOS3_VIDEO][:, :, 5],
+        processed[COSMOS3_COMPOSED_IMAGE][:, 5].permute(0, 3, 1, 2),
+    )
+
+    clean_action = processed[COSMOS3_CLEAN_ACTION]
+    assert clean_action.shape == (1, cfg.chunk_size + 1, cfg.max_action_dim)
+    torch.testing.assert_close(clean_action[0, 0, :8], torch.tensor([0, 0, 0, 0, 0, 0, 0, 0.75]).float())
+    torch.testing.assert_close(clean_action[0, 1, :8], torch.tensor([0, 0, 0, 0, 0, 0, 0, 0.25]).float())
+    assert torch.count_nonzero(clean_action[..., 8:]) == 0
 
 
 def test_cosmos3_native_action_prompt_matches_robolab_string_transform():
@@ -165,3 +203,21 @@ def test_cosmos3_select_action_uses_chunk_queue(monkeypatch):
     torch.testing.assert_close(action_0, fixed_chunk[:, 0])
     torch.testing.assert_close(action_1, fixed_chunk[:, 1])
     assert sample_calls["count"] == 1
+
+
+def test_cosmos3_masked_flow_matching_mse_matches_native_denominator():
+    policy = Cosmos3Policy(make_config())
+    pred = torch.tensor([[0.0, 0.0], [2.0, 4.0]])
+    target = torch.tensor([[5.0, 5.0], [1.0, 1.0]])
+    noisy_mask = torch.tensor([[0.0], [1.0]])
+
+    torch.testing.assert_close(
+        policy.model._masked_flow_matching_mse(pred, target, noisy_mask),
+        torch.tensor(2.5),
+    )
+
+    policy.config.normalize_loss_by_active = True
+    torch.testing.assert_close(
+        policy.model._masked_flow_matching_mse(pred, target, noisy_mask),
+        torch.tensor(5.0),
+    )

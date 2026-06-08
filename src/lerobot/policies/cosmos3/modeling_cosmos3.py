@@ -37,10 +37,12 @@ from .processor_cosmos3 import (
     COSMOS3_ACTION_CONDITION,
     COSMOS3_ACTION_CONDITION_MASK,
     COSMOS3_ACTION_DOMAIN_ID,
+    COSMOS3_CLEAN_ACTION,
     COSMOS3_COMPOSED_IMAGE,
     COSMOS3_CONDITIONING_FPS,
     COSMOS3_PROMPT,
     COSMOS3_RAW_ACTION_DIM,
+    COSMOS3_TRAINING_SIGMA,
     COSMOS3_VIDEO,
 )
 
@@ -438,6 +440,7 @@ class Cosmos3ActionModel(nn.Module):
         super().__init__()
         self.config = config
         self.pipeline = pipeline
+        self.transformer = None
         self._native_service = None
         self._native_robolab = None
         self._empty = nn.Parameter(torch.empty(0), requires_grad=False)
@@ -448,6 +451,7 @@ class Cosmos3ActionModel(nn.Module):
             and config.load_diffusers_pipeline
         ):
             self.pipeline = self._load_pipeline(config)
+        self._register_pipeline_modules()
 
     def reset_generation(self) -> None:
         self._rng = np.random.default_rng(self.config.seed)
@@ -478,12 +482,277 @@ class Cosmos3ActionModel(nn.Module):
         pipeline.to(config.device)
         return pipeline
 
+    def _register_pipeline_modules(self) -> None:
+        if self.pipeline is not None and isinstance(getattr(self.pipeline, "transformer", None), nn.Module):
+            self.transformer = self.pipeline.transformer
+
     def compute_loss(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
-        raise NotImplementedError(
-            "Cosmos3 training loss is not wired yet. The expected loss is 10 * world-model "
-            "flow-matching MSE plus 10 * action flow-matching MSE, matching "
-            "outputs/docs/cosmos3_policy_droid_loss_formula.md."
+        if self.pipeline is None:
+            if self.config.diffusers_model_name_or_path is not None and self.config.load_diffusers_pipeline:
+                self.pipeline = self._load_pipeline(self.config)
+                self._register_pipeline_modules()
+            else:
+                raise RuntimeError(
+                    "Cosmos3 training loss requires a Diffusers Cosmos3OmniPipeline. "
+                    "Set diffusers_model_name_or_path with load_diffusers_pipeline=True or pass pipeline=...."
+                )
+
+        required = [
+            COSMOS3_PROMPT,
+            COSMOS3_VIDEO,
+            COSMOS3_ACTION_CONDITION,
+            COSMOS3_ACTION_CONDITION_MASK,
+            COSMOS3_ACTION_DOMAIN_ID,
+            COSMOS3_CONDITIONING_FPS,
+            COSMOS3_RAW_ACTION_DIM,
+        ]
+        missing = [key for key in required if key not in batch]
+        if missing:
+            raise ValueError(f"Cosmos3 training batch is missing required model inputs: {missing}")
+
+        prompts = batch[COSMOS3_PROMPT]
+        if isinstance(prompts, str):
+            prompts = [prompts]
+        videos = batch[COSMOS3_VIDEO]
+        if videos.ndim == 4:
+            videos = videos.unsqueeze(0)
+        action_conditions = batch[COSMOS3_ACTION_CONDITION]
+        if action_conditions.ndim == 2:
+            action_conditions = action_conditions.unsqueeze(0)
+        action_condition_masks = batch[COSMOS3_ACTION_CONDITION_MASK]
+        if action_condition_masks.ndim == 2:
+            action_condition_masks = action_condition_masks.unsqueeze(0)
+
+        batch_size = len(prompts)
+        clean_actions = self._prepare_clean_action_tokens(batch, action_conditions)
+        sigmas = self._get_training_sigmas(batch, batch_size=batch_size)
+
+        losses = []
+        vision_losses = []
+        action_losses = []
+        for batch_idx in range(batch_size):
+            sample_losses = self._compute_single_training_loss(
+                prompt=prompts[batch_idx],
+                video=videos[batch_idx],
+                clean_action=clean_actions[batch_idx],
+                action_condition_mask=action_condition_masks[batch_idx],
+                domain_id=batch[COSMOS3_ACTION_DOMAIN_ID][batch_idx],
+                conditioning_fps=batch[COSMOS3_CONDITIONING_FPS][batch_idx],
+                raw_action_dim=batch[COSMOS3_RAW_ACTION_DIM][batch_idx],
+                sigma=sigmas[batch_idx],
+            )
+            losses.append(sample_losses["loss"])
+            vision_losses.append(sample_losses["flow_matching_loss_vision"])
+            action_losses.append(sample_losses["flow_matching_loss_action"])
+
+        loss = torch.stack(losses).mean()
+        vision_loss = torch.stack(vision_losses).mean()
+        action_loss = torch.stack(action_losses).mean()
+        metrics = {
+            "loss": float(loss.detach().cpu()),
+            "flow_matching_loss_vision": float(vision_loss.detach().cpu()),
+            "flow_matching_loss_action": float(action_loss.detach().cpu()),
+        }
+        return loss, metrics
+
+    def _prepare_clean_action_tokens(self, batch: dict[str, Tensor], action_conditions: Tensor) -> Tensor:
+        if COSMOS3_CLEAN_ACTION in batch:
+            clean_action = batch[COSMOS3_CLEAN_ACTION]
+            if clean_action.ndim == 2:
+                clean_action = clean_action.unsqueeze(0)
+            if clean_action.shape[-1] < self.config.max_action_dim:
+                clean_action = F.pad(clean_action, (0, self.config.max_action_dim - clean_action.shape[-1]))
+            return clean_action[:, :, : self.config.max_action_dim].to(dtype=torch.float32)
+
+        if ACTION not in batch:
+            raise ValueError(
+                f"Cosmos3 training requires {COSMOS3_CLEAN_ACTION!r} or {ACTION!r} action labels."
+            )
+        action = batch[ACTION]
+        if action.ndim == 2:
+            action = action.unsqueeze(0)
+        if action.ndim != 3:
+            raise ValueError(f"Cosmos3 action labels must have shape [B,T,D], got {tuple(action.shape)}.")
+
+        batch_size, action_len, _ = action_conditions.shape
+        clean_action = torch.zeros(
+            batch_size,
+            action_len,
+            self.config.max_action_dim,
+            dtype=torch.float32,
+            device=action_conditions.device,
         )
+        clean_action[:, :, : self.config.raw_action_dim] = action_conditions[
+            :, :, : self.config.raw_action_dim
+        ].to(dtype=torch.float32)
+        action = (
+            action[:, : self.config.chunk_size, : self.config.raw_action_dim].to(dtype=torch.float32).clone()
+        )
+        if self.config.invert_gripper:
+            action[:, :, -1] = 1.0 - action[:, :, -1]
+        future_start = int(self.config.use_state)
+        clean_action[:, future_start : future_start + action.shape[1], : self.config.raw_action_dim] = action
+        return clean_action
+
+    def _get_training_sigmas(self, batch: dict[str, Tensor], *, batch_size: int) -> Tensor:
+        device = self.pipeline._get_execution_device()
+        if COSMOS3_TRAINING_SIGMA in batch:
+            sigmas = torch.as_tensor(batch[COSMOS3_TRAINING_SIGMA], device=device, dtype=torch.float32)
+            if sigmas.ndim == 0:
+                sigmas = sigmas.expand(batch_size, 1)
+            elif sigmas.ndim == 1:
+                sigmas = sigmas.view(batch_size, 1)
+            elif sigmas.ndim != 2:
+                raise ValueError(
+                    f"{COSMOS3_TRAINING_SIGMA} must be scalar, [B], or [B,1], got {sigmas.shape}."
+                )
+            return sigmas
+
+        if self.config.train_time_video_distribution == "uniform":
+            t_raw = torch.rand((batch_size, 1), device=device, dtype=torch.float32)
+        elif self.config.train_time_video_distribution == "logitnormal":
+            t_raw = torch.sigmoid(torch.randn((batch_size, 1), device=device, dtype=torch.float32))
+        elif self.config.train_time_video_distribution == "waver":
+            u = torch.rand((batch_size, 1), device=device, dtype=torch.float32)
+            t_raw = 1.0 - u - 1.29 * (torch.cos(torch.pi / 2.0 * u) ** 2 - 1 + u)
+        else:
+            raise ValueError(
+                f"Unsupported Cosmos3 train_time_video_distribution={self.config.train_time_video_distribution!r}."
+            )
+
+        tau = 1.0 - t_raw
+        shift = float(self.config.shift)
+        return shift * tau / (1.0 + (shift - 1.0) * tau)
+
+    def _compute_single_training_loss(
+        self,
+        *,
+        prompt: str,
+        video: Tensor,
+        clean_action: Tensor,
+        action_condition_mask: Tensor,
+        domain_id: Tensor,
+        conditioning_fps: Tensor,
+        raw_action_dim: Tensor,
+        sigma: Tensor,
+    ) -> dict[str, Tensor]:
+        pipeline = self.pipeline
+        device = pipeline._get_execution_device()
+        dtype = pipeline.transformer.dtype
+        raw_action_dim_int = int(raw_action_dim.item())
+
+        vision_tensor, action_image_size, height, width = _prepare_native_action_video_conditioning(
+            video,
+            resolution_tier=self.config.resolution_tier,
+            num_frames=self.config.chunk_size + 1,
+            device=device,
+            dtype=dtype,
+        )
+        with torch.no_grad():
+            clean_vision = _encode_video_native_order(pipeline, vision_tensor).contiguous().float()
+            clean_vision = pipeline._remove_action_video_padding_from_latent(clean_vision, action_image_size)
+
+        vision_condition_mask = torch.zeros(
+            (clean_vision.shape[2], 1, 1),
+            device=device,
+            dtype=torch.float32,
+        )
+        vision_condition_mask[0, 0, 0] = 1.0
+        sigma = sigma.to(device=device, dtype=torch.float32).view(1, 1, 1, 1, 1)
+        vision_noisy_mask = 1.0 - vision_condition_mask.view(1, 1, clean_vision.shape[2], 1, 1)
+        vision_sigma = sigma * vision_noisy_mask
+        epsilon_vision = torch.randn(clean_vision.shape, device=device, dtype=torch.float32)
+        noised_vision = epsilon_vision * vision_sigma + clean_vision * (1.0 - vision_sigma)
+        target_vision = epsilon_vision - clean_vision
+
+        action_dim = pipeline.transformer.action_dim
+        clean_action = clean_action.to(device=device, dtype=torch.float32)
+        if clean_action.shape[-1] < action_dim:
+            clean_action = F.pad(clean_action, (0, action_dim - clean_action.shape[-1]))
+        clean_action = clean_action[:, :action_dim]
+        action_condition_mask = action_condition_mask.to(device=device, dtype=torch.float32)
+        sigma_action = sigma.view(1, 1) * (1.0 - action_condition_mask)
+        epsilon_action = torch.randn(clean_action.shape, device=device, dtype=torch.float32)
+        noised_action = epsilon_action * sigma_action + clean_action * (1.0 - sigma_action)
+        target_action = epsilon_action - clean_action
+        noised_action[:, raw_action_dim_int:] = 0
+
+        cond_input_ids, _uncond_input_ids = self._tokenize_native_action_prompts(
+            prompt=prompt,
+            num_frames=self.config.chunk_size + 1,
+            height=height,
+            width=width,
+            fps=float(conditioning_fps.item()),
+        )
+        cond_text_segment = pipeline._prepare_text_segment(cond_input_ids, device=device)
+        packed_static = self._pack_static_segments(
+            text_segment=cond_text_segment,
+            latents=noised_vision.to(dtype=dtype),
+            action_latents=noised_action.to(dtype=dtype),
+            vision_condition_indexes=[0],
+            fps_vision=float(conditioning_fps.item()),
+            action_start_frame_offset=0 if self.config.use_state else 1,
+        )
+
+        max_timestep = float(pipeline.scheduler.config.num_train_timesteps)
+        timestep = sigma.flatten()[0] * max_timestep
+        vision_timesteps = torch.full(
+            (packed_static["num_noisy_vision_tokens"],),
+            float(timestep.item()),
+            device=device,
+            dtype=torch.float32,
+        )
+        action_timesteps = torch.full(
+            (packed_static["num_noisy_action_tokens"],),
+            float(timestep.item()),
+            device=device,
+            dtype=torch.float32,
+        )
+        action_domain_id = domain_id.to(device=device, dtype=torch.long).view(1)
+
+        pred_vision, pred_action = self._predict_velocity(
+            packed_static=packed_static,
+            vision_tokens=noised_vision.to(dtype=dtype),
+            action_tokens=noised_action.to(dtype=dtype),
+            vision_timesteps=vision_timesteps,
+            action_timesteps=action_timesteps,
+            action_domain_id=action_domain_id,
+            vision_condition_mask=vision_condition_mask.to(dtype=dtype),
+            action_condition_mask=action_condition_mask.to(dtype=dtype),
+            raw_action_dim=raw_action_dim_int,
+        )
+
+        target_vision = target_vision[0].to(device=pred_vision.device, dtype=torch.float32)
+        vision_noisy_mask = vision_noisy_mask[0, 0].to(device=pred_vision.device, dtype=torch.float32)
+        vision_loss = self._masked_flow_matching_mse(
+            pred_vision.to(dtype=torch.float32),
+            target_vision,
+            vision_noisy_mask,
+        )
+
+        action_noisy_mask = (1.0 - action_condition_mask).to(device=pred_action.device, dtype=torch.float32)
+        action_loss = self._masked_flow_matching_mse(
+            pred_action[:, :raw_action_dim_int].to(dtype=torch.float32),
+            target_action[:, :raw_action_dim_int].to(device=pred_action.device, dtype=torch.float32),
+            action_noisy_mask,
+        )
+        total_loss = (
+            self.config.video_loss_weight * vision_loss + self.config.action_loss_weight * action_loss
+        )
+        return {
+            "loss": total_loss,
+            "flow_matching_loss_vision": vision_loss,
+            "flow_matching_loss_action": action_loss,
+        }
+
+    def _masked_flow_matching_mse(self, pred: Tensor, target: Tensor, noisy_mask: Tensor) -> Tensor:
+        noisy_mask = noisy_mask.to(device=pred.device, dtype=pred.dtype)
+        sqerr = (pred - target) ** 2 * noisy_mask
+        if not self.config.normalize_loss_by_active:
+            return sqerr.mean()
+
+        active_count = noisy_mask.expand_as(pred).sum()
+        return sqerr.sum() / active_count.clamp_min(1.0)
 
     @torch.no_grad()
     def sample_actions(self, batch: dict[str, Tensor], **kwargs) -> Tensor:

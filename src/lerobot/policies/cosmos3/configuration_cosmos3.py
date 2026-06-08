@@ -137,6 +137,8 @@ class Cosmos3Config(PreTrainedConfig):
     # Cosmos3 action generation settings matching the RoboLab policy server defaults.
     domain_name: str = "droid_lerobot"
     domain_id: int = COSMOS3_DROID_DOMAIN_ID
+    eos_token_id: int = 151645
+    start_of_generation_token_id: int = 151652
     mode: str = "policy"
     viewpoint: str = "concat_view"
     additional_view_description: str = COSMOS3_CONCAT_VIEW_DESCRIPTION

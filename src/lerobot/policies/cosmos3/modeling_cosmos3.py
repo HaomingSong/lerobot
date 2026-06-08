@@ -699,7 +699,7 @@ class Cosmos3ActionModel(nn.Module):
             action_latents=noised_action.to(dtype=dtype),
             vision_condition_indexes=[0],
             fps_vision=float(conditioning_fps.item()),
-            action_start_frame_offset=1,
+            action_start_frame_offset=0 if self.config.use_state else 1,
         )
 
         max_timestep = float(getattr(self.scheduler.config, "num_train_timesteps", 1000))
@@ -915,7 +915,7 @@ class Cosmos3ActionModel(nn.Module):
             action_latents=action_latents,
             vision_condition_indexes=vision_condition_indexes,
             fps_vision=float(conditioning_fps.item()),
-            action_start_frame_offset=1,
+            action_start_frame_offset=0 if self.config.use_state else 1,
         )
         uncond_packed_static = self._pack_static_segments(
             text_segment=self._prepare_text_segment(uncond_input_ids, device=device),
@@ -923,7 +923,7 @@ class Cosmos3ActionModel(nn.Module):
             action_latents=action_latents,
             vision_condition_indexes=vision_condition_indexes,
             fps_vision=float(conditioning_fps.item()),
-            action_start_frame_offset=1,
+            action_start_frame_offset=0 if self.config.use_state else 1,
         )
 
         scheduler = self.scheduler
@@ -999,6 +999,13 @@ class Cosmos3ActionModel(nn.Module):
 
     def _prepare_text_segment(self, input_ids: Tensor, device: torch.device | str) -> dict[str, Any]:
         input_ids = torch.as_tensor(input_ids, dtype=torch.long, device=device)
+        input_ids = torch.cat(
+            [
+                input_ids,
+                input_ids.new_tensor([self.config.eos_token_id, self.config.start_of_generation_token_id]),
+            ],
+            dim=0,
+        )
         config = self.transformer.config
         und_len = int(input_ids.numel())
         text_mrope_ids, next_mrope_offset = get_3d_mrope_ids_text_tokens(

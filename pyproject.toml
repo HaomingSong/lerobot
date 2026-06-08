@@ -224,7 +224,7 @@ cosmos3 = [
     "accelerate>=1.13.0,<2.0.0",
     "av>=16.1.0,<17.0.0",
     "cattrs>=26.1.0,<27.0.0",
-    "diffusers @ git+https://github.com/huggingface/diffusers.git@main",
+    "diffusers @ git+https://github.com/huggingface/diffusers.git@f3d42be118f9af7ed9697b686fba09a8bdcd71d1",
     "hydra-core>=1.3.2,<2.0.0",
     "imageio>=2.37.2,<3.0.0",
     "imageio-ffmpeg>=0.6.0,<1.0.0",

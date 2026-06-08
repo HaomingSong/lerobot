@@ -45,7 +45,39 @@ from lerobot.utils.constants import ACTION, OBS_STATE
 def make_config() -> Cosmos3Config:
     return Cosmos3Config(
         device="cpu",
-        load_diffusers_pipeline=False,
+        load_pretrained_weights=False,
+        transformer_config={
+            "hidden_size": 8,
+            "intermediate_size": 16,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 4,
+            "patch_latent_dim": 4,
+            "latent_channel": 4,
+            "latent_patch_size": 1,
+            "action_dim": 64,
+            "action_gen": True,
+            "vocab_size": 128,
+            "rope_scaling": {"mrope_section": [2, 1, 1]},
+        },
+        wan_vae_config={
+            "base_dim": 4,
+            "decoder_base_dim": 4,
+            "z_dim": 4,
+            "dim_mult": [1],
+            "num_res_blocks": 1,
+            "attn_scales": [],
+            "temperal_downsample": [],  # spellchecker:disable-line
+            "scale_factor_temporal": 1,
+            "scale_factor_spatial": 1,
+        },
+        scheduler_config={
+            "prediction_type": "flow_prediction",
+            "use_flow_sigmas": True,
+            "use_karras_sigmas": False,
+            "flow_shift": 5.0,
+        },
         input_features={
             COSMOS3_LEFT_IMAGE: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 360, 640)),
             COSMOS3_RIGHT_IMAGE: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 360, 640)),
@@ -65,7 +97,7 @@ def constant_image_sequence(value: int, num_frames: int) -> torch.Tensor:
 
 
 def test_cosmos3_factory_registration():
-    cfg = make_policy_config("cosmos3", device="cpu", load_diffusers_pipeline=False)
+    cfg = make_policy_config("cosmos3", device="cpu", load_pretrained_weights=False)
 
     assert isinstance(cfg, Cosmos3Config)
     assert get_policy_class("cosmos3") is Cosmos3Policy

@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -45,6 +45,7 @@ from lerobot.utils.constants import (
     POLICY_POSTPROCESSOR_DEFAULT_NAME,
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
+from lerobot.utils.import_utils import require_package
 
 from .configuration_cosmos3 import Cosmos3Config
 
@@ -58,8 +59,52 @@ COSMOS3_RAW_ACTION_DIM = "cosmos3_raw_action_dim"
 COSMOS3_CLEAN_ACTION = "cosmos3_clean_action"
 COSMOS3_IMAGE_SIZE = "cosmos3_image_size"
 COSMOS3_PROMPT = "cosmos3_prompt"
+COSMOS3_FORMATTED_PROMPT = "cosmos3_formatted_prompt"
+COSMOS3_COND_INPUT_IDS = "cosmos3_cond_input_ids"
+COSMOS3_UNCOND_INPUT_IDS = "cosmos3_uncond_input_ids"
 COSMOS3_SEQUENCE_METADATA = "cosmos3_sequence_metadata"
 COSMOS3_TRAINING_SIGMA = "cosmos3_training_sigma"
+
+COSMOS3_VISION_START_TOKEN = "<|vision_start|>"  # nosec B105
+COSMOS3_VISION_END_TOKEN = "<|vision_end|>"  # nosec B105
+
+_ACTION_RESOLUTION_BINS = {
+    "256": {
+        "1.0": (256, 256),
+        "0.8": (256, 320),
+        "1.25": (320, 256),
+        "0.6": (192, 320),
+        "1.6666666666666667": (320, 192),
+    },
+    "480": {
+        "1.0": (640, 640),
+        "0.7391304347826086": (544, 736),
+        "1.3529411764705883": (736, 544),
+        "0.5769230769230769": (480, 832),
+        "1.7333333333333334": (832, 480),
+    },
+    "704": {
+        "1.0": (960, 960),
+        "0.7647058823529411": (832, 1088),
+        "1.3076923076923077": (1088, 832),
+        "0.55": (704, 1280),
+        "1.8181818181818181": (1280, 704),
+    },
+    "720": {
+        "1.0": (960, 960),
+        "0.7536231884057971": (832, 1104),
+        "1.3269230769230769": (1104, 832),
+        "0.5625": (720, 1280),
+        "1.7777777777777777": (1280, 720),
+    },
+}
+
+_VIEWPOINT_TEMPLATES = {
+    "concat_view": "This video contains concatenated views from multiple camera perspectives.",
+    "ego_view": "This video is captured from a first-person perspective looking at the scene.",
+    "third_person_view": "This video is captured from a third-person perspective looking towards the agent from the front.",
+    "wrist_view": "This video is captured from a wrist-mounted camera.",
+}
 
 
 def _as_batched_image_tensor(image: torch.Tensor) -> tuple[torch.Tensor, bool]:
@@ -211,6 +256,87 @@ def _normalise_prompt_list(prompts: Any, batch_size: int) -> list[str]:
     raise ValueError(f"Expected a prompt string or list[str] with batch_size={batch_size}, got {prompts!r}")
 
 
+def _append_sentence(text: str, addition: str) -> str:
+    if not addition:
+        return text
+    if not text:
+        return addition
+    separator = " " if text.rstrip().endswith(".") else ". "
+    return text.rstrip() + separator + addition
+
+
+def classify_cosmos3_action_size(
+    source_height: int,
+    source_width: int,
+    *,
+    resolution_tier: int,
+) -> tuple[int, int, int, int]:
+    resolution_key = str(resolution_tier)
+    if resolution_key not in _ACTION_RESOLUTION_BINS:
+        raise ValueError(
+            f"Unsupported action resolution_tier={resolution_tier!r}; "
+            f"expected one of {sorted(int(k) for k in _ACTION_RESOLUTION_BINS)}."
+        )
+
+    aspect_ratio = source_height / source_width
+    ratios = _ACTION_RESOLUTION_BINS[resolution_key]
+    target_height, target_width = min(
+        ratios.values(),
+        key=lambda size: abs((size[0] / size[1]) - aspect_ratio),
+    )
+    scale = min(target_width / source_width, target_height / source_height, 1.0)
+    content_height = max(1, int(scale * source_height + 0.5))
+    content_width = max(1, int(scale * source_width + 0.5))
+    return target_height, target_width, content_height, content_width
+
+
+def format_cosmos3_action_prompt(
+    prompt: str,
+    *,
+    viewpoint: str,
+    additional_view_description: str,
+    num_frames: int,
+    height: int,
+    width: int,
+    fps: float,
+) -> str:
+    caption = prompt.rstrip()
+    viewpoint_text = _VIEWPOINT_TEMPLATES.get(viewpoint)
+    if viewpoint_text is not None:
+        additional_view_description = additional_view_description.rstrip()
+        if additional_view_description:
+            viewpoint_text = _append_sentence(viewpoint_text, additional_view_description)
+        caption = _append_sentence(caption, viewpoint_text)
+
+    duration = int(num_frames / fps) if fps > 0 else 0
+    caption = _append_sentence(caption, f"The video is {duration:.1f} seconds long and is of {fps:.0f} FPS.")
+    caption = _append_sentence(caption, f"This video is of {height}x{width} resolution.")
+    return caption
+
+
+def add_cosmos3_special_tokens(tokenizer: Any) -> dict[str, int]:
+    existing_special_tokens: list[str] = []
+    for value in tokenizer.special_tokens_map.values():
+        if isinstance(value, str):
+            existing_special_tokens.append(value)
+        elif isinstance(value, list):
+            existing_special_tokens.extend(value)
+
+    tokens_to_add = []
+    if COSMOS3_VISION_START_TOKEN not in existing_special_tokens:
+        tokens_to_add.append(COSMOS3_VISION_START_TOKEN)
+    if COSMOS3_VISION_END_TOKEN not in existing_special_tokens:
+        tokens_to_add.append(COSMOS3_VISION_END_TOKEN)
+    if tokens_to_add:
+        tokenizer.add_tokens(tokens_to_add)
+
+    return {
+        "start_of_generation": tokenizer.convert_tokens_to_ids(COSMOS3_VISION_START_TOKEN),
+        "end_of_generation": tokenizer.convert_tokens_to_ids(COSMOS3_VISION_END_TOKEN),
+        "eos_token_id": tokenizer.eos_token_id,
+    }
+
+
 @dataclass
 @ProcessorStepRegistry.register(name="cosmos3_robolab_pack_inputs")
 class Cosmos3RoboLabPackInputsStep(ComplementaryDataProcessorStep):
@@ -228,6 +354,8 @@ class Cosmos3RoboLabPackInputsStep(ComplementaryDataProcessorStep):
     domain_id: int
     conditioning_fps: float
     resolution_tier: int
+    viewpoint: str
+    additional_view_description: str
     prompt_key: str = "task"
     composed_image_height: int = 540
     composed_image_width: int = 640
@@ -327,7 +455,25 @@ class Cosmos3RoboLabPackInputsStep(ComplementaryDataProcessorStep):
             complementary_data[COSMOS3_CLEAN_ACTION] = clean_action
 
         prompts = _normalise_prompt_list(complementary_data.get(self.prompt_key), batch_size)
+        target_height, target_width, content_height, content_width = classify_cosmos3_action_size(
+            self.composed_image_height,
+            self.composed_image_width,
+            resolution_tier=self.resolution_tier,
+        )
+        formatted_prompts = [
+            format_cosmos3_action_prompt(
+                prompt,
+                viewpoint=self.viewpoint,
+                additional_view_description=self.additional_view_description,
+                num_frames=self.chunk_size + 1,
+                height=target_height,
+                width=target_width,
+                fps=self.conditioning_fps,
+            )
+            for prompt in prompts
+        ]
         complementary_data[COSMOS3_PROMPT] = prompts
+        complementary_data[COSMOS3_FORMATTED_PROMPT] = formatted_prompts
         complementary_data[COSMOS3_COMPOSED_IMAGE] = composed
         complementary_data[COSMOS3_VIDEO] = video
         complementary_data[COSMOS3_ACTION_CONDITION] = action_condition
@@ -342,7 +488,7 @@ class Cosmos3RoboLabPackInputsStep(ComplementaryDataProcessorStep):
             (batch_size,), self.raw_action_dim, dtype=torch.long
         )
         complementary_data[COSMOS3_IMAGE_SIZE] = torch.tensor(
-            [self.composed_image_height, self.composed_image_width],
+            [target_height, target_width, content_height, content_width],
             dtype=torch.long,
         ).expand(batch_size, -1)
         complementary_data[COSMOS3_SEQUENCE_METADATA] = {
@@ -373,9 +519,80 @@ class Cosmos3RoboLabPackInputsStep(ComplementaryDataProcessorStep):
             "domain_id": self.domain_id,
             "conditioning_fps": self.conditioning_fps,
             "resolution_tier": self.resolution_tier,
+            "viewpoint": self.viewpoint,
+            "additional_view_description": self.additional_view_description,
             "prompt_key": self.prompt_key,
             "composed_image_height": self.composed_image_height,
             "composed_image_width": self.composed_image_width,
+        }
+
+
+@dataclass
+@ProcessorStepRegistry.register(name="cosmos3_qwen_prompt_tokenizer")
+class Cosmos3QwenPromptTokenizerStep(ComplementaryDataProcessorStep):
+    processor_name: str
+    local_files_only: bool = True
+
+    _tokenizer: Any | None = field(default=None, init=False, repr=False)
+    _special_tokens: dict[str, int] = field(default_factory=dict, init=False, repr=False)
+
+    def __post_init__(self):
+        require_package("transformers", extra="cosmos3")
+        try:
+            from transformers import Qwen3VLProcessor
+
+            processor = Qwen3VLProcessor.from_pretrained(
+                self.processor_name,
+                local_files_only=self.local_files_only,
+            )
+            tokenizer = processor.tokenizer
+        except (OSError, ValueError, ImportError):
+            from transformers import AutoTokenizer
+
+            tokenizer = AutoTokenizer.from_pretrained(
+                self.processor_name,
+                local_files_only=self.local_files_only,
+            )
+
+        self._tokenizer = tokenizer
+        self._special_tokens = add_cosmos3_special_tokens(tokenizer)
+
+    def _tokenize(self, text: str) -> torch.Tensor:
+        input_ids = self._tokenizer.apply_chat_template(
+            [{"role": "user", "content": text}],
+            tokenize=True,
+            add_generation_prompt=True,
+            add_vision_id=False,
+            return_dict=False,
+        )
+        input_ids = list(input_ids) + [
+            self._special_tokens["eos_token_id"],
+            self._special_tokens["start_of_generation"],
+        ]
+        return torch.tensor(input_ids, dtype=torch.long)
+
+    def complementary_data(self, complementary_data: dict[str, Any]) -> dict[str, Any]:
+        prompts = complementary_data.get(COSMOS3_FORMATTED_PROMPT)
+        if prompts is None:
+            raise ValueError(f"{COSMOS3_FORMATTED_PROMPT} is required for Cosmos3 prompt tokenization.")
+        if isinstance(prompts, str):
+            prompts = [prompts]
+
+        cond_ids = [self._tokenize(prompt) for prompt in prompts]
+        uncond_ids = [self._tokenize("") for _ in prompts]
+        complementary_data[COSMOS3_COND_INPUT_IDS] = cond_ids
+        complementary_data[COSMOS3_UNCOND_INPUT_IDS] = uncond_ids
+        return complementary_data
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        return features
+
+    def get_config(self) -> dict[str, Any]:
+        return {
+            "processor_name": self.processor_name,
+            "local_files_only": self.local_files_only,
         }
 
 
@@ -413,10 +630,19 @@ def make_cosmos3_pre_post_processors(
             domain_id=config.domain_id,
             conditioning_fps=config.conditioning_fps,
             resolution_tier=config.resolution_tier,
+            viewpoint=config.viewpoint,
+            additional_view_description=config.additional_view_description,
             prompt_key=config.prompt_key,
         ),
-        DeviceProcessorStep(device=config.device),
     ]
+    if config.text_processor_name_or_path is not None:
+        input_steps.append(
+            Cosmos3QwenPromptTokenizerStep(
+                processor_name=config.text_processor_name_or_path,
+                local_files_only=config.local_files_only,
+            )
+        )
+    input_steps.append(DeviceProcessorStep(device=config.device))
 
     output_steps: list[ProcessorStep] = [
         UnnormalizerProcessorStep(

@@ -16,7 +16,11 @@
 
 from __future__ import annotations
 
+import json
+from copy import deepcopy
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 
 from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature, PreTrainedConfig
 from lerobot.optim import AdamWConfig, CosineDecayWithWarmupSchedulerConfig
@@ -33,26 +37,71 @@ COSMOS3_CONCAT_VIEW_DESCRIPTION = (
     "opposite sides, with the robot visible."
 )
 
+_TRANSFORMER_CONFIG_DROP_KEYS = {
+    "_class_name",
+    "_diffusers_version",
+    "freeze_und",
+    "hidden_act",
+    "initializer_range",
+    "joint_attn_implementation",
+    "max_action_dim",
+    "max_position_embeddings",
+    "model_type",
+    "position_embedding_type",
+    "qk_norm",
+    "qk_norm_for_diffusion",
+    "qk_norm_for_text",
+    "temporal_compression_factor_sound",
+    "use_cache",
+    "use_moe",
+    "video_temporal_causal",
+}
+
+_VAE_CONFIG_DROP_KEYS = {"_class_name", "_diffusers_version"}
+_SCHEDULER_CONFIG_DROP_KEYS = {"_class_name", "_diffusers_version"}
+
+
+def _read_json_if_present(path: Path) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    with path.open() as f:
+        return json.load(f)
+
+
+def _without_keys(config: dict[str, Any] | None, keys: set[str]) -> dict[str, Any] | None:
+    if config is None:
+        return None
+    cleaned = deepcopy(config)
+    for key in keys:
+        cleaned.pop(key, None)
+    return cleaned
+
 
 @PreTrainedConfig.register_subclass("cosmos3")
 @dataclass
 class Cosmos3Config(PreTrainedConfig):
-    """Configuration for Cosmos3 action-policy integration in LeRobot."""
+    """Configuration for the Diffusers-model-level Cosmos3 policy integration."""
 
-    # Optional original Diffusers/Cosmos checkpoint used to initialize the runtime pipeline.
+    # Model-level initialization sources. `diffusers_model_name_or_path` may point
+    # at a Diffusers-style Cosmos3 checkpoint with transformer/, vae/, scheduler/,
+    # and text tokenizer files. LeRobot checkpoints store the resolved sub-configs
+    # below and load weights via `PreTrainedPolicy.from_pretrained`.
     diffusers_model_name_or_path: str | None = None
-    native_model_name_or_path: str | None = None
-    qwen3_vl_config: dict | None = None
-    wan_vae_config: dict | None = None
-    transformer_config: dict | None = None
+    base_model_name_or_path: str | None = None
+    qwen3_vl_name_or_path: str | None = None
+    text_processor_name_or_path: str | None = None
+    transformer_config: dict[str, Any] | None = None
+    wan_vae_config: dict[str, Any] | None = None
+    scheduler_config: dict[str, Any] | None = None
 
-    # Loading controls. Unit tests and checkpoint conversion can instantiate the policy
-    # without loading the large Diffusers pipeline by setting this to False.
-    load_diffusers_pipeline: bool = True
-    runtime_backend: str = "diffusers"  # Options: "diffusers", "native"
+    # Public model-level loading controls.
+    load_pretrained_weights: bool = True
+    freeze_vae: bool = True
+    drop_sound_modules: bool = True
+    copy_understanding_to_generation_expert: bool = False
     dtype: str = "bfloat16"  # Options: "bfloat16", "float32"
-    attn_implementation: str | None = None
-    enable_safety_checker: bool = False
+    transformer_attention_backend: str | None = None
+    local_files_only: bool = True
 
     # RoboLab/DROID policy contract.
     n_obs_steps: int = 1
@@ -117,14 +166,13 @@ class Cosmos3Config(PreTrainedConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        self._populate_serialized_subconfigs()
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
                 f"n_action_steps ({self.n_action_steps}) cannot be greater than chunk_size ({self.chunk_size})"
             )
         if self.dtype not in {"bfloat16", "float32"}:
             raise ValueError(f"Invalid dtype: {self.dtype!r}")
-        if self.runtime_backend not in {"diffusers", "native"}:
-            raise ValueError(f"Invalid runtime_backend: {self.runtime_backend!r}")
         if self.mode != "policy":
             raise ValueError("Cosmos3Config currently supports only action mode='policy'.")
         if self.action_space != "joint_pos":
@@ -133,6 +181,52 @@ class Cosmos3Config(PreTrainedConfig):
             raise ValueError("history_length must be at least 1 when use_state=True.")
         if self.raw_action_dim != self.joint_position_dim + self.gripper_position_dim:
             raise ValueError("raw_action_dim must equal joint_position_dim + gripper_position_dim.")
+
+    def _populate_serialized_subconfigs(self) -> None:
+        source = self.diffusers_model_name_or_path or self.base_model_name_or_path
+        if source is None:
+            return
+
+        model_path = Path(source)
+        if not model_path.is_dir():
+            return
+
+        if self.transformer_config is None:
+            self.transformer_config = _read_json_if_present(model_path / "transformer" / "config.json")
+        if self.wan_vae_config is None:
+            self.wan_vae_config = _read_json_if_present(model_path / "vae" / "config.json")
+        if self.scheduler_config is None:
+            self.scheduler_config = _read_json_if_present(model_path / "scheduler" / "scheduler_config.json")
+        if self.text_processor_name_or_path is None:
+            text_tokenizer_path = model_path / "text_tokenizer"
+            self.text_processor_name_or_path = str(
+                text_tokenizer_path if text_tokenizer_path.is_dir() else model_path
+            )
+
+    @property
+    def transformer_backbone_config(self) -> dict[str, Any]:
+        config = _without_keys(self.transformer_config, _TRANSFORMER_CONFIG_DROP_KEYS)
+        if config is None:
+            config = {
+                "action_dim": self.max_action_dim,
+                "action_gen": True,
+                "sound_dim": None,
+                "sound_gen": False,
+            }
+        if self.drop_sound_modules:
+            config["sound_dim"] = None
+            config["sound_gen"] = False
+        config.setdefault("action_dim", self.max_action_dim)
+        config.setdefault("action_gen", True)
+        return config
+
+    @property
+    def vae_config(self) -> dict[str, Any] | None:
+        return _without_keys(self.wan_vae_config, _VAE_CONFIG_DROP_KEYS)
+
+    @property
+    def unipc_scheduler_config(self) -> dict[str, Any] | None:
+        return _without_keys(self.scheduler_config, _SCHEDULER_CONFIG_DROP_KEYS)
 
     def validate_features(self) -> None:
         if self.input_features is None:

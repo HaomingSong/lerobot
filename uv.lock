@@ -1150,7 +1150,7 @@ wheels = [
 [[package]]
 name = "diffusers"
 version = "0.39.0.dev0"
-source = { git = "https://github.com/huggingface/diffusers.git?rev=main#f3d42be118f9af7ed9697b686fba09a8bdcd71d1" }
+source = { git = "https://github.com/huggingface/diffusers.git?rev=f3d42be118f9af7ed9697b686fba09a8bdcd71d1#f3d42be118f9af7ed9697b686fba09a8bdcd71d1" }
 dependencies = [
     { name = "filelock" },
     { name = "httpx" },
@@ -3106,7 +3106,7 @@ requires-dist = [
     { name = "debugpy", marker = "extra == 'dev'", specifier = ">=1.8.1,<1.9.0" },
     { name = "decord", marker = "(platform_machine == 'AMD64' and extra == 'groot') or (platform_machine == 'x86_64' and extra == 'groot')", specifier = ">=0.6.0,<1.0.0" },
     { name = "deepdiff", marker = "extra == 'deepdiff-dep'", specifier = ">=7.0.1,<9.0.0" },
-    { name = "diffusers", marker = "extra == 'cosmos3'", git = "https://github.com/huggingface/diffusers.git?rev=main" },
+    { name = "diffusers", marker = "extra == 'cosmos3'", git = "https://github.com/huggingface/diffusers.git?rev=f3d42be118f9af7ed9697b686fba09a8bdcd71d1" },
     { name = "diffusers", marker = "extra == 'diffusers-dep'", specifier = ">=0.36.0,<0.40.0" },
     { name = "dm-tree", marker = "extra == 'groot'", specifier = ">=0.1.8,<1.0.0" },
     { name = "draccus", specifier = "==0.10.0" },

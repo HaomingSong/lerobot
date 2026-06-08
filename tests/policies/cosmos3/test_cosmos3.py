@@ -45,7 +45,6 @@ from lerobot.utils.constants import ACTION, OBS_STATE
 def make_config() -> Cosmos3Config:
     return Cosmos3Config(
         device="cpu",
-        load_pretrained_weights=False,
         transformer_config={
             "hidden_size": 8,
             "intermediate_size": 16,
@@ -97,7 +96,7 @@ def constant_image_sequence(value: int, num_frames: int) -> torch.Tensor:
 
 
 def test_cosmos3_factory_registration():
-    cfg = make_policy_config("cosmos3", device="cpu", load_pretrained_weights=False)
+    cfg = make_policy_config("cosmos3", device="cpu")
 
     assert isinstance(cfg, Cosmos3Config)
     assert get_policy_class("cosmos3") is Cosmos3Policy
@@ -105,6 +104,23 @@ def test_cosmos3_factory_registration():
     preprocessor, postprocessor = make_pre_post_processors(cfg)
     assert preprocessor.name == "policy_preprocessor"
     assert postprocessor.name == "policy_postprocessor"
+
+
+def test_cosmos3_config_ignores_external_checkpoint_layout(tmp_path):
+    transformer_dir = tmp_path / "transformer"
+    transformer_dir.mkdir()
+    (transformer_dir / "config.json").write_text('{"hidden_size": 999}', encoding="utf-8")
+
+    cfg = Cosmos3Config(
+        device="cpu",
+        diffusers_model_name_or_path=str(tmp_path),
+        transformer_config={"hidden_size": 8, "action_dim": 64, "action_gen": True},
+        wan_vae_config={"z_dim": 4},
+        scheduler_config={"flow_shift": 5.0},
+    )
+
+    assert cfg.transformer_config == {"hidden_size": 8, "action_dim": 64, "action_gen": True}
+    assert cfg.text_processor_name_or_path is None
 
 
 def test_cosmos3_robolab_processor_packs_native_contract():

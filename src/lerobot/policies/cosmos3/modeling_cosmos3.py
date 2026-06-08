@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import json
 import math
 from collections import deque
 from pathlib import Path
@@ -25,7 +24,6 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
-from safetensors import safe_open
 from torch import Tensor, nn
 
 from lerobot.configs import PreTrainedConfig
@@ -85,35 +83,6 @@ def _retrieve_latents(encoder_output: Any, *, sample_mode: str = "argmax") -> to
     if sample_mode == "sample":
         return latent_dist.sample()
     raise ValueError(f"Unsupported VAE latent sample_mode={sample_mode!r}.")
-
-
-def _read_safetensors_index(index_path: Path) -> list[Path]:
-    with index_path.open() as f:
-        index = json.load(f)
-    shards = sorted(set(index["weight_map"].values()))
-    return [index_path.parent / shard for shard in shards]
-
-
-def _load_safetensors_state_dict(path: Path) -> dict[str, Tensor]:
-    if path.is_file():
-        shard_paths = [path]
-    elif (path / "diffusion_pytorch_model.safetensors.index.json").is_file():
-        shard_paths = _read_safetensors_index(path / "diffusion_pytorch_model.safetensors.index.json")
-    elif (path / "model.safetensors.index.json").is_file():
-        shard_paths = _read_safetensors_index(path / "model.safetensors.index.json")
-    elif (path / "diffusion_pytorch_model.safetensors").is_file():
-        shard_paths = [path / "diffusion_pytorch_model.safetensors"]
-    elif (path / "model.safetensors").is_file():
-        shard_paths = [path / "model.safetensors"]
-    else:
-        raise FileNotFoundError(f"No safetensors checkpoint found under {path}")
-
-    state_dict: dict[str, Tensor] = {}
-    for shard_path in shard_paths:
-        with safe_open(shard_path, framework="pt", device="cpu") as f:
-            for key in sorted(f.keys()):
-                state_dict[key] = f.get_tensor(key)
-    return state_dict
 
 
 def get_3d_mrope_ids_text_tokens(
@@ -337,176 +306,28 @@ class Cosmos3ActionModel(nn.Module):
             return int(self.config.seed)
         return int(self._rng.integers(0, 2**31))
 
-    def _pretrained_source_path(self) -> Path | None:
-        source = self.config.diffusers_model_name_or_path or self.config.base_model_name_or_path
-        if source is None:
-            return None
-        source_path = Path(source)
-        return source_path if source_path.is_dir() else None
-
     def _build_transformer(self) -> nn.Module:
         from diffusers import Cosmos3OmniTransformer
 
-        source_path = self._pretrained_source_path()
         torch_dtype = _torch_dtype(self.config.dtype)
-        if (
-            source_path is not None
-            and self.config.load_pretrained_weights
-            and self.config.pretrained_path is None
-            and not self._must_filter_source_sound_modules(source_path)
-        ):
-            return Cosmos3OmniTransformer.from_pretrained(
-                source_path,
-                subfolder="transformer",
-                torch_dtype=torch_dtype,
-                local_files_only=self.config.local_files_only,
-            )
-
         transformer = Cosmos3OmniTransformer(**self.config.transformer_backbone_config)
-        if (
-            source_path is not None
-            and self.config.load_pretrained_weights
-            and self.config.pretrained_path is None
-        ):
-            self._load_diffusers_transformer_weights(transformer, source_path / "transformer")
-        elif self.config.qwen3_vl_name_or_path is not None and self.config.pretrained_path is None:
-            self._load_qwen3vl_understanding_weights(transformer, Path(self.config.qwen3_vl_name_or_path))
-
-        if self.config.copy_understanding_to_generation_expert:
-            self._copy_understanding_to_generation_expert(transformer)
         return transformer.to(dtype=torch_dtype)
-
-    def _must_filter_source_sound_modules(self, source_path: Path) -> bool:
-        config_path = source_path / "transformer" / "config.json"
-        if not self.config.drop_sound_modules or not config_path.is_file():
-            return False
-        with config_path.open() as f:
-            source_config = json.load(f)
-        return bool(source_config.get("sound_gen"))
-
-    def _load_diffusers_transformer_weights(self, transformer: nn.Module, transformer_path: Path) -> None:
-        state_dict = _load_safetensors_state_dict(transformer_path)
-        if self.config.drop_sound_modules:
-            state_dict = {
-                key: value
-                for key, value in state_dict.items()
-                if not key.startswith(("audio_proj_in.", "audio_proj_out.", "audio_modality_embed"))
-            }
-        incompatible = transformer.load_state_dict(state_dict, strict=False)
-        unexpected = [
-            key
-            for key in incompatible.unexpected_keys
-            if not key.startswith(("audio_proj_in.", "audio_proj_out.", "audio_modality_embed"))
-        ]
-        if unexpected:
-            raise RuntimeError(
-                f"Unexpected Cosmos3 transformer keys after sound filtering: {unexpected[:16]}"
-            )
-
-    def _load_qwen3vl_understanding_weights(self, transformer: nn.Module, qwen_path: Path) -> None:
-        if not qwen_path.exists():
-            return
-        source_state = _load_safetensors_state_dict(qwen_path)
-        remapped: dict[str, Tensor] = {}
-        target_shapes = {key: value.shape for key, value in transformer.state_dict().items()}
-        for key, value in source_state.items():
-            new_key = self._remap_qwen3vl_key(key)
-            if new_key is not None and new_key in target_shapes and target_shapes[new_key] == value.shape:
-                remapped[new_key] = value
-        transformer.load_state_dict(remapped, strict=False)
-
-    def _remap_qwen3vl_key(self, key: str) -> str | None:
-        prefixes = ("model.language_model.", "language_model.", "model.")
-        for prefix in prefixes:
-            if key.startswith(prefix):
-                key = key[len(prefix) :]
-                break
-        if key.startswith("visual.") or key.startswith("vision_model."):
-            return None
-        replacements = [
-            (".self_attn.q_proj.", ".self_attn.to_q."),
-            (".self_attn.k_proj.", ".self_attn.to_k."),
-            (".self_attn.v_proj.", ".self_attn.to_v."),
-            (".self_attn.o_proj.", ".self_attn.to_out."),
-            (".self_attn.q_norm.", ".self_attn.norm_q."),
-            (".self_attn.k_norm.", ".self_attn.norm_k."),
-        ]
-        for old, new in replacements:
-            if old in key:
-                return key.replace(old, new)
-        return key
-
-    def _copy_understanding_to_generation_expert(self, transformer: nn.Module) -> None:
-        state = transformer.state_dict()
-        replacements = [
-            (".self_attn.add_q_proj.", ".self_attn.to_q."),
-            (".self_attn.add_k_proj.", ".self_attn.to_k."),
-            (".self_attn.add_v_proj.", ".self_attn.to_v."),
-            (".self_attn.to_add_out.", ".self_attn.to_out."),
-            (".self_attn.norm_added_q.", ".self_attn.norm_q."),
-            (".self_attn.norm_added_k.", ".self_attn.norm_k."),
-            (".mlp_moe_gen.", ".mlp."),
-            (".input_layernorm_moe_gen.", ".input_layernorm."),
-            (".post_attention_layernorm_moe_gen.", ".post_attention_layernorm."),
-        ]
-        with torch.no_grad():
-            for target_key, target_tensor in state.items():
-                source_key = None
-                for old, new in replacements:
-                    if old in target_key:
-                        source_key = target_key.replace(old, new)
-                        break
-                if target_key == "norm_moe_gen.weight":
-                    source_key = "norm.weight"
-                if (
-                    source_key is not None
-                    and source_key in state
-                    and state[source_key].shape == target_tensor.shape
-                ):
-                    target_tensor.copy_(state[source_key])
 
     def _build_vae(self) -> nn.Module:
         from diffusers import AutoencoderKLWan
 
-        source_path = self._pretrained_source_path()
         torch_dtype = _torch_dtype(self.config.dtype)
-        if (
-            source_path is not None
-            and self.config.load_pretrained_weights
-            and self.config.pretrained_path is None
-        ):
-            return AutoencoderKLWan.from_pretrained(
-                source_path,
-                subfolder="vae",
-                torch_dtype=torch_dtype,
-                local_files_only=self.config.local_files_only,
-            )
         if self.config.vae_config is not None:
             return AutoencoderKLWan(**self.config.vae_config).to(dtype=torch_dtype)
-        return AutoencoderKLWan().to(dtype=torch_dtype)
+        raise ValueError(
+            "Cosmos3Config.wan_vae_config is required. "
+            "Load a converted LeRobot Cosmos3 checkpoint or provide the serialized VAE config."
+        )
 
     def _build_scheduler(self) -> Any:
         from diffusers import UniPCMultistepScheduler
 
-        source_path = self._pretrained_source_path()
-        if (
-            source_path is not None
-            and self.config.load_pretrained_weights
-            and self.config.pretrained_path is None
-        ):
-            return UniPCMultistepScheduler.from_pretrained(
-                source_path,
-                subfolder="scheduler",
-                local_files_only=self.config.local_files_only,
-            )
-        if self.config.unipc_scheduler_config is not None:
-            return UniPCMultistepScheduler.from_config(self.config.unipc_scheduler_config)
-        return UniPCMultistepScheduler(
-            prediction_type="flow_prediction",
-            use_flow_sigmas=True,
-            use_karras_sigmas=False,
-            flow_shift=float(self.config.shift),
-        )
+        return UniPCMultistepScheduler.from_config(self.config.unipc_scheduler_config)
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         required = [

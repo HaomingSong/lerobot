@@ -16,10 +16,7 @@
 
 from __future__ import annotations
 
-import json
-from copy import deepcopy
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature, PreTrainedConfig
@@ -62,23 +59,13 @@ _VAE_CONFIG_DROP_KEYS = {"_class_name", "_diffusers_version", "clip_output"}
 _SCHEDULER_CONFIG_DROP_KEYS = {"_class_name", "_diffusers_version"}
 
 
-def _read_json_if_present(path: Path) -> dict[str, Any] | None:
-    if not path.is_file():
-        return None
-    with path.open() as f:
-        return json.load(f)
-
-
 def _without_keys(config: dict[str, Any] | None, keys: set[str]) -> dict[str, Any] | None:
     if config is None:
         return None
-    cleaned = deepcopy(config)
-    for key in keys:
-        cleaned.pop(key, None)
-    return cleaned
+    return {key: value for key, value in config.items() if key not in keys}
 
 
-def _native_action_scheduler_config(config: dict[str, Any] | None, *, shift: float) -> dict[str, Any]:
+def _action_scheduler_config(config: dict[str, Any] | None, *, shift: float) -> dict[str, Any]:
     normalized = _without_keys(config, _SCHEDULER_CONFIG_DROP_KEYS) or {}
     normalized.update(
         {
@@ -98,25 +85,26 @@ def _native_action_scheduler_config(config: dict[str, Any] | None, *, shift: flo
 @PreTrainedConfig.register_subclass("cosmos3")
 @dataclass
 class Cosmos3Config(PreTrainedConfig):
-    """Configuration for the Diffusers-model-level Cosmos3 policy integration."""
+    """Configuration for LeRobot-format Cosmos3 policy checkpoints."""
 
-    # Model-level initialization sources. `diffusers_model_name_or_path` may point
-    # at a Diffusers-style Cosmos3 checkpoint with transformer/, vae/, scheduler/,
-    # and text tokenizer files. LeRobot checkpoints store the resolved sub-configs
-    # below and load weights via `PreTrainedPolicy.from_pretrained`.
-    diffusers_model_name_or_path: str | None = None
-    base_model_name_or_path: str | None = None
-    qwen3_vl_name_or_path: str | None = None
+    # Converted LeRobot checkpoints store component configs here and load all
+    # model weights through PreTrainedPolicy.from_pretrained(model.safetensors).
     text_processor_name_or_path: str | None = None
     transformer_config: dict[str, Any] | None = None
     wan_vae_config: dict[str, Any] | None = None
     scheduler_config: dict[str, Any] | None = None
 
-    # Public model-level loading controls.
-    load_pretrained_weights: bool = True
-    freeze_vae: bool = True
+    # Legacy fields accepted only so older converted LeRobot config.json files
+    # continue to parse. Runtime initialization ignores external source paths.
+    diffusers_model_name_or_path: str | None = None
+    base_model_name_or_path: str | None = None
+    qwen3_vl_name_or_path: str | None = None
+    load_pretrained_weights: bool = False
     drop_sound_modules: bool = True
     copy_understanding_to_generation_expert: bool = False
+
+    # Public model-level loading controls.
+    freeze_vae: bool = True
     dtype: str = "bfloat16"  # Options: "bfloat16", "float32"
     transformer_attention_backend: str | None = None
     local_files_only: bool = True
@@ -186,8 +174,6 @@ class Cosmos3Config(PreTrainedConfig):
 
     def __post_init__(self):
         super().__post_init__()
-        self._populate_serialized_subconfigs()
-        self.scheduler_config = _native_action_scheduler_config(self.scheduler_config, shift=self.shift)
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
                 f"n_action_steps ({self.n_action_steps}) cannot be greater than chunk_size ({self.chunk_size})"
@@ -203,40 +189,16 @@ class Cosmos3Config(PreTrainedConfig):
         if self.raw_action_dim != self.joint_position_dim + self.gripper_position_dim:
             raise ValueError("raw_action_dim must equal joint_position_dim + gripper_position_dim.")
 
-    def _populate_serialized_subconfigs(self) -> None:
-        source = self.diffusers_model_name_or_path or self.base_model_name_or_path
-        if source is None:
-            return
-
-        model_path = Path(source)
-        if not model_path.is_dir():
-            return
-
-        if self.transformer_config is None:
-            self.transformer_config = _read_json_if_present(model_path / "transformer" / "config.json")
-        if self.wan_vae_config is None:
-            self.wan_vae_config = _read_json_if_present(model_path / "vae" / "config.json")
-        if self.scheduler_config is None:
-            self.scheduler_config = _read_json_if_present(model_path / "scheduler" / "scheduler_config.json")
-        if self.text_processor_name_or_path is None:
-            text_tokenizer_path = model_path / "text_tokenizer"
-            self.text_processor_name_or_path = str(
-                text_tokenizer_path if text_tokenizer_path.is_dir() else model_path
-            )
-
     @property
     def transformer_backbone_config(self) -> dict[str, Any]:
         config = _without_keys(self.transformer_config, _TRANSFORMER_CONFIG_DROP_KEYS)
         if config is None:
-            config = {
-                "action_dim": self.max_action_dim,
-                "action_gen": True,
-                "sound_dim": None,
-                "sound_gen": False,
-            }
-        if self.drop_sound_modules:
-            config["sound_dim"] = None
-            config["sound_gen"] = False
+            raise ValueError(
+                "Cosmos3Config.transformer_config is required. "
+                "Load a converted LeRobot Cosmos3 checkpoint or provide the serialized transformer config."
+            )
+        config["sound_dim"] = None
+        config["sound_gen"] = False
         config.setdefault("action_dim", self.max_action_dim)
         config.setdefault("action_gen", True)
         return config
@@ -246,8 +208,8 @@ class Cosmos3Config(PreTrainedConfig):
         return _without_keys(self.wan_vae_config, _VAE_CONFIG_DROP_KEYS)
 
     @property
-    def unipc_scheduler_config(self) -> dict[str, Any] | None:
-        return _native_action_scheduler_config(self.scheduler_config, shift=self.shift)
+    def unipc_scheduler_config(self) -> dict[str, Any]:
+        return _action_scheduler_config(self.scheduler_config, shift=self.shift)
 
     def validate_features(self) -> None:
         if self.input_features is None:

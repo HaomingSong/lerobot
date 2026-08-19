@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import builtins
+from collections.abc import Iterable
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, TypeVar
@@ -51,13 +52,29 @@ def find_latest_hub_checkpoint(
             has no checkpoints.
     """
     files = HfApi().list_repo_files(repo_id=repo_id, repo_type="model", revision=revision, token=token)
-    prefix = f"{CHECKPOINTS_DIR}/"
-    steps = {
-        name for f in files if f.startswith(prefix) and (name := f[len(prefix) :].split("/", 1)[0]).isdigit()
-    }
+    steps = list_checkpoint_steps(files)
     if not steps:
         return None
     return f"{CHECKPOINTS_DIR}/{max(steps, key=int)}"
+
+
+def list_checkpoint_steps(files: Iterable[str]) -> set[str]:
+    """Step directory names under ``checkpoints/`` in a repo file listing.
+
+    Split out of ``find_latest_hub_checkpoint`` so a caller that already holds a listing can
+    pick a step from it without paying for a second ``list_repo_files`` round trip.
+
+    Args:
+        files (Iterable[str]): Repo-relative file paths, as returned by ``list_repo_files``.
+
+    Returns:
+        set[str]: The step directory names, keeping their zero padding (e.g. ``{"005000"}``).
+            Empty when the listing holds no checkpoints.
+    """
+    prefix = f"{CHECKPOINTS_DIR}/"
+    return {
+        name for f in files if f.startswith(prefix) and (name := f[len(prefix) :].split("/", 1)[0]).isdigit()
+    }
 
 
 class HubMixin:

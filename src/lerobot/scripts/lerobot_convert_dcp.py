@@ -15,12 +15,20 @@
 # limitations under the License.
 """Convert a DCP-format checkpoint into a distributable safetensors model, offline.
 
-Runs single-process (no GPUs, no process group). Example:
+Runs single-process (no GPUs, no process group). The checkpoint comes either from a local
+directory or from a Hub training repo:
 
 ```bash
 lerobot-convert-dcp --checkpoint_dir=outputs/train/run/checkpoints/005000
 lerobot-convert-dcp --checkpoint_dir=... --delete_dcp=true --push_to_hub=user/my-policy
+lerobot-convert-dcp --repo_id=user/my-run
+lerobot-convert-dcp --repo_id=user/my-run --checkpoint_step=5000 --push_to_hub=user/my-run
 ```
+
+`--repo_id` downloads the checkpoint into `--output_dir` and then behaves exactly as if that
+directory had been passed as `--checkpoint_dir`. Only runs that pushed with
+`--save_checkpoint_to_hub` carry DCP shards on the Hub: a published model repo holds
+safetensors only, so there is nothing there to convert.
 
 `--push_to_hub` publishes the converted directory as a model repo, degrading gracefully: the
 core artifacts (model.safetensors, config.json, processor files) always upload; the README
@@ -33,11 +41,12 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
-from huggingface_hub import HfApi
+from huggingface_hub import HfApi, snapshot_download
 
 from lerobot.configs import parser
 from lerobot.distributed.checkpoint import dcp_to_safetensors
-from lerobot.utils.constants import PRETRAINED_MODEL_DIR
+from lerobot.utils.constants import CHECKPOINTS_DIR, PRETRAINED_MODEL_DIR
+from lerobot.utils.hub import list_checkpoint_steps
 from lerobot.utils.utils import init_logging
 
 
@@ -45,14 +54,47 @@ from lerobot.utils.utils import init_logging
 class ConvertDcpConfig:
     """CLI config for the offline DCP-to-safetensors checkpoint conversion."""
 
-    # A checkpoint step directory (containing pretrained_model/) or a pretrained_model
-    # directory itself.
-    checkpoint_dir: Path
-    # Remove the DCP shard directory after a successful conversion.
+    # A local checkpoint step directory (containing pretrained_model/) or a pretrained_model
+    # directory itself. Mutually exclusive with repo_id.
+    checkpoint_dir: Path | None = None
+    # A Hub model repo to read the checkpoint from, e.g. "user/my-run". Mutually exclusive
+    # with checkpoint_dir. This is the source; --push_to_hub is the destination.
+    repo_id: str | None = None
+    # Repo revision (branch, tag, or commit sha) to read. Checkpoint pushes tag every commit
+    # with its step, so a step identifier also works here. Requires repo_id.
+    revision: str | None = None
+    # Which checkpoints/<step>/ directory to convert; defaults to the highest step present.
+    # Zero padding is optional — "5000" and "005000" both select step 5000. Requires repo_id.
+    checkpoint_step: str | None = None
+    # Where the downloaded checkpoint is written; defaults to
+    # outputs/convert_dcp/<repo id with "/" replaced>. Requires repo_id.
+    output_dir: Path | None = None
+    # Remove the DCP shard directory after a successful conversion. With repo_id this removes
+    # the downloaded copy only — the Hub repo keeps its shards.
     delete_dcp: bool = False
     # Publish the converted directory to this Hub repo id (e.g. "user/my-policy").
     push_to_hub: str | None = None
     private: bool | None = None
+
+    def __post_init__(self) -> None:
+        """Reject ambiguous or inert input rather than silently picking a source.
+
+        Raises:
+            ValueError: If neither or both of `checkpoint_dir` and `repo_id` are given, or if a
+                Hub-only option is set while converting a local directory.
+        """
+        if (self.checkpoint_dir is None) == (self.repo_id is None):
+            raise ValueError(
+                "Pass exactly one source: --checkpoint_dir for a local checkpoint, or --repo_id "
+                "for one on the Hub."
+            )
+        if self.repo_id is None:
+            inert = [n for n in ("revision", "checkpoint_step", "output_dir") if getattr(self, n) is not None]
+            if inert:
+                raise ValueError(
+                    f"{', '.join(f'--{n}' for n in inert)}: only meaningful with --repo_id. "
+                    "--checkpoint_dir converts a directory in place."
+                )
 
 
 def _locate_pretrained_dir(checkpoint_dir: Path) -> Path:
@@ -68,6 +110,124 @@ def _locate_pretrained_dir(checkpoint_dir: Path) -> Path:
     """
     nested = checkpoint_dir / PRETRAINED_MODEL_DIR
     return nested if nested.is_dir() else checkpoint_dir
+
+
+def _repo_join(*parts: str) -> str:
+    """Join repo-relative path segments, dropping the empty ones that stand for the repo root."""
+    return "/".join(p for p in parts if p)
+
+
+def _default_output_dir(repo_id: str) -> Path:
+    """Where a Hub checkpoint lands when `--output_dir` is not given.
+
+    Args:
+        repo_id (str): The source Hub model repo id.
+
+    Returns:
+        Path: `outputs/convert_dcp/<repo id with "/" replaced by "_">`.
+    """
+    return Path("outputs") / "convert_dcp" / repo_id.replace("/", "_")
+
+
+def _select_checkpoint_prefix(files: list[str], repo_id: str, checkpoint_step: str | None) -> str:
+    """Pick which directory of a Hub repo to convert, from its file listing.
+
+    Training runs push to `checkpoints/<step>/` (see `push_checkpoint_to_hub`), so a step is
+    selected there; a repo with no such tree is assumed to hold a checkpoint uploaded to its
+    root by hand.
+
+    Args:
+        files (list[str]): Repo-relative file paths, as returned by `list_repo_files`.
+        repo_id (str): The source repo id, for error messages.
+        checkpoint_step (str | None): The requested step, zero padding optional. None selects
+            the highest step present.
+
+    Returns:
+        str: The repo-relative directory to convert, or `""` for the repo root.
+
+    Raises:
+        ValueError: If `checkpoint_step` is not a step number.
+        FileNotFoundError: If `checkpoint_step` names a step the repo does not have.
+    """
+    steps = list_checkpoint_steps(files)
+    if checkpoint_step is not None:
+        if not checkpoint_step.isdigit():
+            raise ValueError(f"--checkpoint_step takes a step number, got '{checkpoint_step}'.")
+        # Padding width follows the run's total step count, so compare numerically.
+        match = next((s for s in steps if int(s) == int(checkpoint_step)), None)
+        if match is None:
+            available = ", ".join(sorted(steps, key=int)) or "none"
+            raise FileNotFoundError(
+                f"'{repo_id}' has no checkpoint at step {int(checkpoint_step)} (available: {available})."
+            )
+        return f"{CHECKPOINTS_DIR}/{match}"
+    if steps:
+        return f"{CHECKPOINTS_DIR}/{max(steps, key=int)}"
+    return ""
+
+
+def _fetch_hub_checkpoint(
+    repo_id: str,
+    output_dir: Path,
+    *,
+    revision: str | None = None,
+    checkpoint_step: str | None = None,
+) -> Path:
+    """Download a DCP checkpoint from a Hub training repo, and return its local directory.
+
+    Only the model shards are fetched. The step directory on the Hub also holds
+    `training_state/`, whose optimizer shards outweigh the model itself and which conversion
+    never reads, so it is left there.
+
+    Args:
+        repo_id (str): The Hub model repo holding the checkpoint.
+        output_dir (Path): The local directory the checkpoint is downloaded into.
+        revision (str | None): Repo revision (branch, tag, or commit sha) to read. Defaults to
+            None (the default branch).
+        checkpoint_step (str | None): Which `checkpoints/<step>/` directory to fetch. Defaults
+            to None (the highest step present).
+
+    Returns:
+        Path: The downloaded checkpoint directory, ready to be passed to
+        `_locate_pretrained_dir`.
+
+    Raises:
+        FileNotFoundError: If the selected directory holds no DCP shards.
+    """
+    from accelerate.utils.constants import FSDP_MODEL_NAME
+
+    files = HfApi().list_repo_files(repo_id=repo_id, repo_type="model", revision=revision)
+    prefix = _select_checkpoint_prefix(files, repo_id, checkpoint_step)
+
+    # Mirror _locate_pretrained_dir against the listing, so an unconvertible repo fails before
+    # a single byte is downloaded: shards sit under <prefix>/pretrained_model/ for a checkpoint
+    # pushed by a training run, or directly under <prefix> for a pretrained_model directory
+    # uploaded on its own.
+    shard_dir = f"{FSDP_MODEL_NAME}_0"
+    nested = _repo_join(prefix, PRETRAINED_MODEL_DIR)
+    for candidate in (nested, prefix):
+        if any(f.startswith(f"{_repo_join(candidate, shard_dir)}/") for f in files):
+            download_root = candidate
+            break
+    else:
+        raise FileNotFoundError(
+            f"No DCP shard directory ('{shard_dir}') under '{prefix or '<repo root>'}' in "
+            f"'{repo_id}'. Shards reach the Hub only from a run trained with "
+            "checkpoint_format=dcp (or safetensors_dcp) and --save_checkpoint_to_hub; a "
+            "published model repo carries safetensors only."
+        )
+
+    logging.info(f"Downloading {_repo_join(repo_id, download_root)} -> {output_dir}")
+    snapshot_download(
+        repo_id=repo_id,
+        repo_type="model",
+        revision=revision,
+        allow_patterns=f"{download_root}/*" if download_root else None,
+        local_dir=str(output_dir),
+    )
+    # snapshot_download keeps repo-relative paths, so the step directory reappears under
+    # output_dir exactly as it is laid out on the Hub.
+    return output_dir / prefix if prefix else output_dir
 
 
 def _publish_converted(pretrained_dir: Path, repo_id: str, private: bool | None) -> None:
@@ -137,9 +297,9 @@ def convert_checkpoint(cfg: ConvertDcpConfig) -> Path:
     """Merge a checkpoint's DCP shards into `model.safetensors`, then optionally publish it.
 
     Args:
-        cfg (ConvertDcpConfig): Conversion options — the checkpoint directory to convert, whether
-            to delete the DCP shards after a successful merge, and the optional Hub repo id (and
-            visibility) to publish the converted directory to.
+        cfg (ConvertDcpConfig): Conversion options — where the checkpoint comes from (a local
+            directory or a Hub repo), whether to delete the DCP shards after a successful merge,
+            and the optional Hub repo id (and visibility) to publish the converted directory to.
 
     Returns:
         Path: The path to the merged `model.safetensors` file.
@@ -150,13 +310,24 @@ def convert_checkpoint(cfg: ConvertDcpConfig) -> Path:
     """
     from accelerate.utils.constants import FSDP_MODEL_NAME
 
-    pretrained_dir = _locate_pretrained_dir(cfg.checkpoint_dir)
+    if cfg.repo_id is not None:
+        checkpoint_dir = _fetch_hub_checkpoint(
+            cfg.repo_id,
+            cfg.output_dir or _default_output_dir(cfg.repo_id),
+            revision=cfg.revision,
+            checkpoint_step=cfg.checkpoint_step,
+        )
+    else:
+        checkpoint_dir = cfg.checkpoint_dir
+    pretrained_dir = _locate_pretrained_dir(checkpoint_dir)
     dcp_dir = pretrained_dir / f"{FSDP_MODEL_NAME}_0"
     if not dcp_dir.is_dir():
         raise FileNotFoundError(
             f"No DCP shard directory at {dcp_dir}. Point --checkpoint_dir at a checkpoint "
             "saved with checkpoint_format=dcp (or safetensors_dcp)."
         )
+    if cfg.delete_dcp and cfg.repo_id:
+        logging.info(f"--delete_dcp removes the downloaded shards only; '{cfg.repo_id}' keeps its copy.")
     logging.info(f"Merging {dcp_dir} -> {pretrained_dir / 'model.safetensors'}")
     safetensors_path = dcp_to_safetensors(dcp_dir, pretrained_dir, delete_dcp=cfg.delete_dcp)
     if cfg.push_to_hub:
